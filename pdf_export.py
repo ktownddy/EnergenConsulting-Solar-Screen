@@ -175,12 +175,21 @@ def build_deal_pdf(inp, out, q: dict) -> bytes:
     yr1_tax_benefits = out.itc_cash_year1 + out.bonus_dep_shield_year1
     net_equity_after_yr1 = equity_at_close - yr1_tax_benefits
 
+    # ITC cash and depreciation shield reported separately. ITC cash is real money
+    # (either used directly or sold via §6418 transfer). Dep shield is a tax benefit
+    # only — valid for owners with sufficient tax appetite. The two residual lines
+    # below show the cash residual and the broader economic residual.
+    net_cash_equity_after_itc = equity_at_close - out.itc_cash_year1
+    net_exposure_after_all = equity_at_close - out.itc_cash_year1 - out.bonus_dep_shield_year1
+
     headline_rows = [
         ["Metric", "Value"],
         ["Total CapEx", _fmt_money(out.total_capex)],
         ["Equity at close", _fmt_money(equity_at_close)],
-        ["Year-1 ITC + depreciation shield", _fmt_money(yr1_tax_benefits)],
-        ["Net equity after Year 1", _fmt_money(net_equity_after_yr1)],
+        ["ITC cash received Year 1 (real cash)", _fmt_money(out.itc_cash_year1)],
+        ["Depreciation tax shield Year 1 (tax benefit, not cash)", _fmt_money(out.bonus_dep_shield_year1)],
+        ["Net cash equity after ITC", _fmt_money(net_cash_equity_after_itc)],
+        ["Net exposure after ITC + depreciation shield", _fmt_money(net_exposure_after_all)],
         ["After-TC payback", f"Year {out.after_tc_payback_year}" if out.after_tc_payback_year else "Never"],
         [irr_label, _fmt_pct(irr_value)],
         ["LCOE (simple)", f"${out.lcoe:.4f}/kWh"],

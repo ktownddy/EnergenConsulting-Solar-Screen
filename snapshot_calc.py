@@ -45,7 +45,12 @@ def build_itc_pct(
     domestic_content: bool,
     low_income: str = "None",  # "None" | "10pp" | "20pp"
 ) -> Tuple[float, dict, List[str]]:
-    """Build §48E applicable percentage from compliance answers."""
+    """
+    Build §48E applicable percentage from compliance answers.
+    Labels are written so each component clearly identifies its own source —
+    the +24pp can come from either PWA compliance OR the small-project exemption,
+    and the +10pp adders are always labeled with the actual qualifying category.
+    """
     components: dict = {}
     warnings: List[str] = []
 
@@ -57,10 +62,16 @@ def build_itc_pct(
         )
         return 0.0, {"No credit (OBBBA cutoff)": 0.0}, warnings
 
-    pwa_effective = under_1_mwac or pwa_directly_met
     components["Base 48E credit"] = 0.06
-    if pwa_effective:
-        components["PWA (+24pp)"] = 0.24
+
+    # The +24pp uplift can come from EITHER the small-project exemption OR PWA.
+    # Check the small-project exemption FIRST — when both are true, "exempt under 1 MWac"
+    # is the operative legal label (PWA isn't actually required for the system to qualify).
+    pwa_effective = under_1_mwac or pwa_directly_met
+    if under_1_mwac:
+        components["Small project exemption (<1 MWac)"] = 0.24
+    elif pwa_directly_met:
+        components["PWA compliance"] = 0.24
     else:
         warnings.append("PWA not met and project is >=1 MWac — credit base is 6%, not 30%.")
 
@@ -82,42 +93,51 @@ def build_itc_pct(
 
 @dataclass
 class SnapshotInputs:
+    """
+    Default values reflect Energen's primary deal profile:
+    a ~59 MWdc ground-mount with a bundled energy+REC offtake at $67/MWh.
+    Adjust per-deal in the UI; these are just the loaded starting case.
+    """
     # Project basics
-    project_type: str = "Rooftop"
-    owner_mode: str = "Customer-owned"       # "Customer-owned" | "Developer-PPA"
-    size_kw_dc: float = 1000.0
-    cost_per_watt: float = 2.50
-    yield_kwh_per_kw: float = 1400.0
+    project_type: str = "Ground (fixed-tilt)"
+    owner_mode: str = "Developer-PPA"              # "Customer-owned" | "Developer-PPA"
+    size_kw_dc: float = 58850.0
+    cost_per_watt: float = 1.84
+    yield_kwh_per_kw: float = 1433.0
 
-    # Revenue
-    customer_current_rate: float = 0.12
-    ppa_rate_to_customer: float = 0.085
-    rate_escalator: float = 0.0250
+    # Revenue (bundled energy + REC rate — do not double-count RECs separately)
+    customer_current_rate: float = 0.0670
+    ppa_rate_to_customer: float = 0.0670
+    rate_escalator: float = 0.0125                  # 1.25% / yr
 
     # Operating — broken out for transparency
-    fixed_om_per_kw_year: float = 12.0       # bundled O&M, $/kWdc-yr
-    land_lease_annual: float = 0.0           # $/yr (often 0 for rooftop)
-    property_tax_annual: float = 0.0         # $/yr (state/local dependent)
-    other_opex_annual: float = 0.0           # insurance, asset mgmt, misc, $/yr
-    opex_escalation: float = 0.025            # annual inflation on OpEx
+    fixed_om_per_kw_year: float = 6.38              # $/kWdc-yr (≈ $375K/yr at 58.85 MWdc)
+    land_lease_annual: float = 203_626.0
+    property_tax_annual: float = 148_609.0
+    other_opex_annual: float = 262_364.0
+    opex_escalation: float = 0.025
     degradation_pct: float = 0.005
     term_years: int = 25
 
     # Tax & credit
-    itc_pct: float = 0.30
+    itc_pct: float = 0.40                           # 30% base + 10pp from Energy Community
     tax_rate: float = 0.27
     bonus_depreciation_pct: float = 1.0
-    transfer_sale_price: float = 0.93        # mid-2026 IG benchmark
-    transfer_transaction_cost_pct: float = 0.02
-    recapture_reserve_pct: float = 0.05
 
-    # OPTIONAL senior debt layer
-    debt_enabled: bool = False
-    debt_pct_of_cost: float = 0.50
+    # Transferability — user's preferred screening assumption is unencumbered
+    # net proceeds (no holdback, no txn cost). Real deals will have both;
+    # adjust on a per-deal basis.
+    transfer_sale_price: float = 0.92
+    transfer_transaction_cost_pct: float = 0.00
+    recapture_reserve_pct: float = 0.00
+
+    # Senior debt — DSCR-sized by default, 1.25x floor, 75% LTC cap, 15-yr amort
+    debt_enabled: bool = True
+    debt_pct_of_cost: float = 0.50                  # only used when debt_sizing_method = "Percent of cost"
     interest_rate: float = 0.0825
     amortization_years: int = 15
-    min_dscr_requirement: float = 1.30
-    debt_sizing_method: str = "Percent of cost"   # "Percent of cost" | "DSCR-sized"
+    min_dscr_requirement: float = 1.25
+    debt_sizing_method: str = "DSCR-sized"          # "Percent of cost" | "DSCR-sized"
     max_ltc_cap: float = 0.75
 
 
@@ -373,7 +393,7 @@ def calculate_snapshot(inp: SnapshotInputs) -> SnapshotOutputs:
         elif savings > 0:
             bits.append(f"thin savings ({savings*100:.1f}c/kWh)")
         else:
-            bits.append("LCOE exceeds current rate — does not save customer money")
+            bits.append("LCOE exceeds current rate (deal relies on tax benefits)")
     else:
         spread = rate_yr1 - lcoe
         if spread > 0.02:
@@ -381,7 +401,7 @@ def calculate_snapshot(inp: SnapshotInputs) -> SnapshotOutputs:
         elif spread > 0:
             bits.append(f"thin PPA margin {spread*100:.1f}c/kWh")
         else:
-            bits.append("PPA rate is below LCOE — losing money on each kWh")
+            bits.append("PPA rate is below LCOE (deal relies on tax benefits)")
 
     if inp.debt_enabled and min_dscr is not None:
         if min_dscr >= inp.min_dscr_requirement:
@@ -396,6 +416,47 @@ def calculate_snapshot(inp: SnapshotInputs) -> SnapshotOutputs:
         warnings.append(f"Cost/Watt of ${inp.cost_per_watt:.2f} is very high — double-check assumptions.")
     if inp.yield_kwh_per_kw < 900 or inp.yield_kwh_per_kw > 2200:
         warnings.append(f"Specific yield {inp.yield_kwh_per_kw} kWh/kWdc-yr is outside typical 1,000–2,000 range.")
+
+    # PPA / customer rate vs simple LCOE — flag if the revenue rate is below project LCOE.
+    # Note: an apparent below-LCOE rate can still pencil thanks to ITC + depreciation,
+    # so the warning is informational, not a kill signal.
+    rate_for_compare = inp.customer_current_rate if inp.owner_mode == "Customer-owned" else inp.ppa_rate_to_customer
+    if rate_for_compare < lcoe:
+        warnings.append(
+            f"PPA rate is below simple LCOE (${rate_for_compare:.4f}/kWh vs ${lcoe:.4f}/kWh); "
+            "project does not recover all-in cost at this revenue rate. Tax credits and "
+            "depreciation can still close the gap, but operating economics are sub-LCOE."
+        )
+
+    # ITC sell price sanity (Developer-PPA only — Customer-owned uses credit directly)
+    if inp.owner_mode == "Developer-PPA":
+        if inp.transfer_sale_price < 0.50 or inp.transfer_sale_price > 1.10:
+            warnings.append(
+                f"ITC sell price of {inp.transfer_sale_price:.2f} is implausible — typical mid-2026 "
+                "market range is 0.82–0.96. Check the input."
+            )
+
+    # Depreciation shield assumes tax appetite — flag clearly when shield is non-zero
+    if inp.bonus_depreciation_pct > 0 and inp.tax_rate > 0 and bonus_dep_shield_year1 > 0:
+        warnings.append(
+            "Depreciation tax shield is counted in cash flows. This assumes the owner has "
+            "sufficient tax appetite to use it (full external income offset). For tax-exempt "
+            "or low-appetite owners, switch the depreciation toggle to No."
+        )
+
+    # Debt sizing source flag — useful for the screener
+    if inp.debt_enabled and debt_amount > 0:
+        if inp.debt_sizing_method == "DSCR-sized":
+            ltc_cap_dollars = total_capex * inp.max_ltc_cap
+            if abs(debt_amount - ltc_cap_dollars) < 1.0:
+                warnings.append(
+                    f"Debt is capped by the {inp.max_ltc_cap*100:.0f}% LTC ceiling, not by DSCR. "
+                    "Project could in theory support more debt under the chosen DSCR floor."
+                )
+            else:
+                warnings.append(
+                    f"Debt is sized by the {inp.min_dscr_requirement:.2f}x DSCR floor (LTC not binding)."
+                )
 
     return SnapshotOutputs(
         total_capex=total_capex,
@@ -467,6 +528,84 @@ def solve_rate_for_irr(inp: SnapshotInputs, target_irr: float,
         else:
             high = mid
     return 0.5 * (low + high)
+
+
+def _set_cost(inp: SnapshotInputs, cost_per_watt: float) -> SnapshotInputs:
+    import copy
+    c = copy.copy(inp)
+    c.cost_per_watt = cost_per_watt
+    return c
+
+
+def solve_cost_for_irr(
+    inp: SnapshotInputs,
+    target_irr: float,
+    low: float = 0.50,
+    high: float = 5.00,
+    tol: float = 1e-4,
+    max_iter: int = 80,
+) -> Optional[float]:
+    """
+    Find the maximum cost-per-watt that still clears the target IRR.
+
+    Lower cost -> higher IRR; higher cost -> lower IRR. Binary search.
+    Returns None if even the cheapest cost in range fails to clear the target
+    (i.e., the deal is fundamentally broken regardless of CapEx).
+    """
+    out_lo = calculate_snapshot(_set_cost(inp, low))
+    out_hi = calculate_snapshot(_set_cost(inp, high))
+    irr_lo, irr_hi = _eff_irr(out_lo), _eff_irr(out_hi)
+
+    if irr_lo < target_irr:
+        return None
+    if irr_hi >= target_irr:
+        return high  # cost is not binding
+
+    for _ in range(max_iter):
+        mid = 0.5 * (low + high)
+        out_mid = calculate_snapshot(_set_cost(inp, mid))
+        irr_mid = _eff_irr(out_mid)
+        if abs(irr_mid - target_irr) < tol:
+            return mid
+        if irr_mid >= target_irr:
+            low = mid          # mid still works, try higher cost
+        else:
+            high = mid         # mid too expensive
+    return 0.5 * (low + high)
+
+
+def solve_cost_for_payback(
+    inp: SnapshotInputs,
+    target_year: int,
+    low: float = 0.50,
+    high: float = 5.00,
+    max_iter: int = 60,
+) -> Optional[float]:
+    """
+    Find the maximum cost-per-watt that still pays back by target_year.
+    Lower cost -> faster payback; higher cost -> slower payback.
+    """
+    out_lo = calculate_snapshot(_set_cost(inp, low))
+    pb_lo = out_lo.after_tc_payback_year
+    if pb_lo is None or pb_lo > target_year:
+        return None
+
+    out_hi = calculate_snapshot(_set_cost(inp, high))
+    pb_hi = out_hi.after_tc_payback_year
+    if pb_hi is not None and pb_hi <= target_year:
+        return high
+
+    for _ in range(max_iter):
+        mid = 0.5 * (low + high)
+        out_mid = calculate_snapshot(_set_cost(inp, mid))
+        pb = out_mid.after_tc_payback_year
+        if pb is None or pb > target_year:
+            high = mid
+        else:
+            low = mid
+        if abs(high - low) < 1e-4:
+            break
+    return low
 
 
 def solve_rate_for_payback(inp: SnapshotInputs, target_year: int,

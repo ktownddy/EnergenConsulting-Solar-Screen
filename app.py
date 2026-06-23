@@ -20,6 +20,8 @@ from snapshot_calc import (
     calculate_snapshot,
     solve_rate_for_irr,
     solve_rate_for_payback,
+    solve_cost_for_irr,
+    solve_cost_for_payback,
     build_itc_pct,
     DEFAULT_YIELDS,
     DEFAULT_OM,
@@ -167,19 +169,18 @@ def _fmt_x(v):
 
 # ---------- Inputs ----------
 if "snap" not in st.session_state:
-    st.session_state.snap = SnapshotInputs(
-        project_type="Rooftop",
-        size_kw_dc=1000.0,
-        cost_per_watt=2.50,
-        yield_kwh_per_kw=1400.0,
-        customer_current_rate=0.12,
-        ppa_rate_to_customer=0.085,
-        fixed_om_per_kw_year=12.0,
-    )
+    # Default to the Energen primary deal profile. The dataclass already carries
+    # the same defaults, but we instantiate explicitly here so the loaded case is
+    # transparent and easy to swap on a per-deal basis.
+    st.session_state.snap = SnapshotInputs()
 if "itc_q" not in st.session_state:
+    # Default ITC stack: 30% base + PWA + Energy Community = 40%.
+    # Energy Community (Option B) is used as the +10pp adder because it's the
+    # more common Energen deal pathway. If a project has verified Domestic Content
+    # instead, the user can toggle DC on and EC off in the credit Q&A section.
     st.session_state.itc_q = {
         "obbba": True, "under_1mw": False, "pwa_direct": True,
-        "ec": False, "dc": False, "li": "None",
+        "ec": True, "dc": False, "li": "None",
     }
 
 f: SnapshotInputs = st.session_state.snap
@@ -448,40 +449,52 @@ st.markdown(
 
 
 # ---------- Headline cards ----------
-# Equity math:
-#   Equity at close = CapEx the sponsor/investor has to fund up front, minus any senior debt
-#   Net equity after Yr 1 = after the ITC cash + depreciation tax shield clear
-#                          (this is the real residual cash-at-risk; can be near zero or negative)
+# ITC cash is real money. Depreciation shield is a tax benefit (only real if the owner
+# has tax appetite). We surface them separately so a user can't accidentally treat the
+# dep shield as project cash.
 equity_at_close = out.total_capex - (out.debt_amount if f.debt_enabled else 0.0)
-year1_tax_benefits = out.itc_cash_year1 + out.bonus_dep_shield_year1
-net_equity_after_yr1 = equity_at_close - year1_tax_benefits
+itc_cash_yr1 = out.itc_cash_year1
+dep_shield_yr1 = out.bonus_dep_shield_year1
+net_cash_after_itc = equity_at_close - itc_cash_yr1                    # cash residual
+net_exposure_after_all = equity_at_close - itc_cash_yr1 - dep_shield_yr1  # economic residual
 
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Total CapEx", _fmt_money(out.total_capex))
 c2.metric("Equity at close", _fmt_money(equity_at_close),
-          help="What you (or your investor) write at financial close. CapEx minus senior debt.")
+          help="What you or your investor write at financial close. CapEx minus senior debt.")
 c3.metric("After-TC payback", f"Yr {out.after_tc_payback_year}" if out.after_tc_payback_year else "Never")
 headline_irr = out.levered_irr if out.levered_irr is not None else out.unlevered_irr
 irr_label = "Levered IRR" if f.debt_enabled and out.debt_amount > 0 else "IRR (post-tax-credit)"
 c4.metric(irr_label, _fmt_pct(headline_irr))
 
 c1, c2, c3, c4 = st.columns(4)
+c1.metric("ITC cash received Yr 1", _fmt_money(itc_cash_yr1),
+          help="Real cash. Either used directly by an owner with tax appetite, or proceeds from a §6418 transfer sale.")
+c2.metric("Depreciation tax shield Yr 1", _fmt_money(dep_shield_yr1),
+          help="Tax benefit (not project cash). Assumes the owner has tax appetite to offset other income.")
+c3.metric(
+    "Net cash equity after ITC",
+    _fmt_money(net_cash_after_itc),
+    help="Equity at close minus the ITC cash. This is the true residual cash exposure of the equity check.",
+)
+c4.metric(
+    "Net exposure after ITC + dep shield",
+    _fmt_money(net_exposure_after_all),
+    help="Further reduced by the depreciation tax shield. Economic residual — only valid if the owner uses the shield against other income.",
+)
+
+# Production and revenue detail row
+c1, c2, c3, c4 = st.columns(4)
 c1.metric("Year-1 production", f"{out.year1_production_kwh/1000:,.0f} MWh")
 c2.metric("Year-1 revenue/savings", _fmt_money(out.year1_revenue_or_savings))
-c3.metric(
-    "Net equity after Yr 1",
-    _fmt_money(net_equity_after_yr1),
-    delta=f"{-year1_tax_benefits/1e6:+.2f}M tax benefits" if year1_tax_benefits > 0 else None,
-    delta_color="inverse",
-    help=("Equity at close minus the Year-1 ITC cash + depreciation tax shield. "
-          "This is the real residual cash exposure. Can be near zero or negative for tax-rich deals."),
-)
-c4.metric("ITC + dep shield Yr 1", _fmt_money(year1_tax_benefits))
+c3.metric("Yr-1 tax benefits", _fmt_money(itc_cash_yr1 + dep_shield_yr1),
+          help="ITC cash + depreciation tax shield combined. The cash piece is the ITC; the dep shield is tax-only.")
+c4.metric("LCOE (simple)", f"${out.lcoe:.4f}/kWh")
 
-# Third row: production-detail + LCOE + simple payback
+# Simple payback row
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Simple payback (no TC)", f"Yr {out.simple_payback_year}" if out.simple_payback_year else "Never")
-c2.metric("LCOE (simple)", f"${out.lcoe:.4f}/kWh")
+c2.write("")
 c3.write("")
 c4.write("")
 
@@ -517,9 +530,13 @@ else:
     )
 
 
-# ---------- Sources & Uses waterfall ----------
-st.markdown("### Where the money comes from")
-st.caption("How CapEx is funded — bar shows total project cost, then each layer of capital and Year-1 tax benefit that closes the gap.")
+# ---------- Capital stack + tax-benefit bridge waterfall ----------
+st.markdown("### Capital stack and Year-1 tax benefits")
+st.caption(
+    "Senior debt and ITC transfer proceeds are real cash sources. "
+    "The depreciation shield is a tax benefit, not project cash — it assumes the owner has sufficient tax appetite. "
+    "The bar on the right is the residual economic exposure once both are applied."
+)
 
 # Waterfall components — positive contributors that fund the CapEx
 funding_labels = ["Total CapEx"]
@@ -631,11 +648,7 @@ if f.debt_enabled and out.debt_amount > 0:
     st.plotly_chart(fig2, use_container_width=True)
 
 
-# ---------- Warnings ----------
-if out.warnings:
-    with st.expander(f"{len(out.warnings)} sanity warnings"):
-        for w in out.warnings:
-            st.warning(w)
+# Warnings are surfaced in a dedicated section below the scenario comparison.
 
 
 # ---------- Solve-for-PPA ----------
@@ -690,6 +703,201 @@ else:
         f"No {rate_label} in the 0c–50c/kWh range delivers {target_irr_pct:.1f}% IRR "
         "at these CapEx + opex assumptions. CapEx or yield needs to move."
     )
+
+
+# ============================================================
+# Solve for max supportable cost  (the inverse view — PPA is fixed, cost is the variable)
+# ============================================================
+st.divider()
+st.markdown("### What project cost can this PPA support?")
+st.caption(
+    "Holds the revenue rate, yield, ITC, and debt assumptions constant, and back-solves "
+    "the maximum cost-per-watt that still clears your IRR and payback targets. Useful when "
+    "the PPA rate is fixed by the offtaker and you need to push CapEx down to clear hurdles."
+)
+
+c1, c2, c3 = st.columns(3)
+cost_target_irr_pct = c1.number_input(
+    "Target IRR (%)", value=10.0, step=0.5, format="%.2f", key="cost_irr",
+    help="Levered IRR if debt is on, otherwise unlevered.",
+)
+cost_min_dscr = c2.number_input(
+    "Min DSCR", value=float(f.min_dscr_requirement), step=0.05, format="%.2f", key="cost_dscr",
+    help="Drives the DSCR floor when re-sizing debt across the search range. Only binds when debt is on with DSCR-sized sizing.",
+)
+cost_target_payback = c3.number_input(
+    "Min acceptable payback (years)", value=10, step=1, min_value=2, max_value=30, key="cost_pb",
+)
+c1, c2, c3 = st.columns(3)
+cost_low = c1.number_input("Cost search range — low ($/Wdc)", value=0.50, step=0.05, format="%.2f", key="c_low")
+cost_high = c2.number_input("Cost search range — high ($/Wdc)", value=5.00, step=0.05, format="%.2f", key="c_high")
+cost_max_ltc_pct = c3.number_input(
+    "Max LTC cap (%)", value=float(f.max_ltc_cap) * 100.0, step=1.0, format="%.1f", key="c_ltc",
+    help="Optional ceiling on leverage when debt is on. Lower than the DSCR-implied debt → LTC binds; higher → DSCR binds.",
+)
+
+# Build a solver-scoped copy of the inputs so the user's DSCR/LTC override on this
+# section drives the solver without mutating state elsewhere on the page.
+import copy as _copy
+cost_case = _copy.copy(f)
+cost_case.min_dscr_requirement = cost_min_dscr
+cost_case.max_ltc_cap = cost_max_ltc_pct / 100.0
+
+max_cost_irr = solve_cost_for_irr(cost_case, target_irr=cost_target_irr_pct/100.0, low=cost_low, high=cost_high)
+max_cost_pb = solve_cost_for_payback(cost_case, target_year=int(cost_target_payback), low=cost_low, high=cost_high)
+
+# Binding constraint = whichever target is more demanding (lower max cost)
+candidates = [c for c in (max_cost_irr, max_cost_pb) if c is not None]
+max_cost = min(candidates) if candidates else None
+binding = None
+if max_cost is not None:
+    if max_cost_irr is not None and abs(max_cost - max_cost_irr) < 1e-3:
+        binding = f"{cost_target_irr_pct:.1f}% IRR"
+    else:
+        binding = f"{cost_target_payback}-yr payback"
+
+# Display
+c1, c2, c3 = st.columns(3)
+c1.metric(
+    "Max cost at target IRR",
+    f"${max_cost_irr:.3f}/Wdc" if max_cost_irr is not None else "N/M",
+    help=f"Highest cost/Wdc that still clears {cost_target_irr_pct:.1f}% IRR. N/M = deal broken even at cheapest cost.",
+)
+c2.metric(
+    "Max cost at target payback",
+    f"${max_cost_pb:.3f}/Wdc" if max_cost_pb is not None else "N/M",
+    help=f"Highest cost/Wdc that still pays back within {cost_target_payback} years.",
+)
+c3.metric(
+    "Binding max supportable cost",
+    f"${max_cost:.3f}/Wdc" if max_cost is not None else "N/M",
+    help=f"Stricter of the two constraints. Currently bound by: {binding}." if binding else "Deal does not work at any cost in the search range.",
+)
+
+if max_cost is not None:
+    current_cost = f.cost_per_watt
+    current_total = f.size_kw_dc * 1000 * current_cost
+    max_total = f.size_kw_dc * 1000 * max_cost
+    diff_per_w = current_cost - max_cost
+    diff_total = current_total - max_total
+    diff_pct = (diff_per_w / current_cost) * 100.0 if current_cost > 0 else 0
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Current cost/Wdc", f"${current_cost:.3f}/Wdc")
+    c2.metric("Max supportable cost", f"${max_cost:.3f}/Wdc")
+    c3.metric(
+        "Required reduction",
+        f"${diff_per_w:.3f}/Wdc" if diff_per_w > 0 else "$0.000/Wdc",
+        delta=f"−{diff_pct:.1f}%" if diff_per_w > 0 else "in the clear",
+        delta_color="off" if diff_per_w <= 0 else "inverse",
+    )
+
+    if diff_per_w <= 0:
+        st.success(
+            f"**Current cost works.** Current ${current_cost:.3f}/Wdc is at or below the "
+            f"max supportable ${max_cost:.3f}/Wdc — deal clears the {binding} hurdle by "
+            f"${-diff_per_w:.3f}/Wdc of headroom."
+        )
+    else:
+        st.error(
+            f"**Current cost too high.** Need to drop "
+            f"${diff_per_w:.3f}/Wdc (≈ ${diff_total/1e6:.2f}M of total CapEx, {diff_pct:.1f}%) "
+            f"to clear the {binding} hurdle."
+        )
+else:
+    st.error(
+        "No cost in the search range delivers both hurdles. This means the deal is broken "
+        "even at the cheapest cost — revenue, yield, or ITC stack need to improve before cost is "
+        "the lever."
+    )
+
+
+# ============================================================
+# Three-case scenario comparison
+# ============================================================
+st.divider()
+st.markdown("### Scenario comparison")
+st.caption("Run three quick cases at different cost/Wdc points. Useful for stress-testing where the deal needs to land on CapEx.")
+c1, c2, c3 = st.columns(3)
+sc_current = c1.number_input("Current case ($/Wdc)", value=float(f.cost_per_watt), step=0.05, format="%.2f", key="sc_curr")
+sc_target = c2.number_input("Target case ($/Wdc)", value=1.53, step=0.05, format="%.2f", key="sc_tgt")
+sc_low = c3.number_input("Low-cost case ($/Wdc)", value=1.46, step=0.05, format="%.2f", key="sc_low")
+
+def _run_case(cost_per_w: float):
+    """Run snapshot with one cost-override; return a compact dict of headline metrics."""
+    import copy as _copy
+    g = _copy.copy(f)
+    g.cost_per_watt = cost_per_w
+    o = calculate_snapshot(g)
+    eq_close = o.total_capex - (o.debt_amount if g.debt_enabled else 0.0)
+    net_cash_eq = eq_close - o.itc_cash_year1
+    headline_irr_v = o.levered_irr if o.levered_irr is not None else o.unlevered_irr
+    return {
+        "Cost/Wdc": f"${cost_per_w:.2f}",
+        "Total CapEx": _fmt_money(o.total_capex),
+        "Senior debt": _fmt_money(o.debt_amount) if g.debt_enabled and o.debt_amount > 0 else "—",
+        "ITC cash (Yr 1)": _fmt_money(o.itc_cash_year1),
+        "Equity at close": _fmt_money(eq_close),
+        "Net cash equity after ITC": _fmt_money(net_cash_eq),
+        "Levered IRR": _fmt_pct(headline_irr_v),
+        "Min DSCR": _fmt_x(o.min_dscr) if g.debt_enabled else "—",
+        "Payback": f"Yr {o.after_tc_payback_year}" if o.after_tc_payback_year else "Never",
+        "Verdict": (
+            "Strong" if (o.after_tc_payback_year is not None and o.after_tc_payback_year <= 7)
+            else "Decent" if (o.after_tc_payback_year is not None and o.after_tc_payback_year <= 10)
+            else "Marginal" if o.after_tc_payback_year is not None
+            else "Doesn't pay back"
+        ),
+    }
+
+scenario_df = pd.DataFrame({
+    "Current": _run_case(sc_current),
+    f"Target (${sc_target:.2f}/W)": _run_case(sc_target),
+    f"Low-cost (${sc_low:.2f}/W)": _run_case(sc_low),
+})
+st.dataframe(scenario_df, use_container_width=True)
+
+
+# ============================================================
+# Cross-cut sanity warnings (in addition to calc-engine warnings)
+# ============================================================
+st.divider()
+st.markdown("### Sanity warnings")
+
+cross_warnings = []
+# Levered IRR below target IRR (using the cost section's target as the reference)
+hl_irr = out.levered_irr if out.levered_irr is not None else out.unlevered_irr
+if hl_irr is not None and hl_irr < cost_target_irr_pct / 100.0:
+    cross_warnings.append(
+        f"Levered IRR ({hl_irr*100:.1f}%) is below your target ({cost_target_irr_pct:.1f}%). "
+        "Either raise the revenue rate, drop CapEx, or layer in more credit/bonuses."
+    )
+# Current cost above solved max supportable cost
+if max_cost is not None and f.cost_per_watt > max_cost:
+    cross_warnings.append(
+        f"Current cost/Wdc (${f.cost_per_watt:.3f}) exceeds the max supportable "
+        f"(${max_cost:.3f}) for your {cost_target_irr_pct:.1f}% IRR + {cost_target_payback}-yr payback hurdles."
+    )
+# Domestic Content selected without explicit verification
+if q.get("dc"):
+    cross_warnings.append(
+        "Domestic Content +10pp selected. Confirm Adjusted Percentage Rule (50% for 2026 BOC) "
+        "or Notice 2025-08 safe harbor evidence is in hand BEFORE relying on this credit."
+    )
+# Energy Community selected without explicit verification
+if q.get("ec"):
+    cross_warnings.append(
+        "Energy Community +10pp selected. Confirm site qualifies per IRS Notice 2026-39 (June 2026) "
+        "as of the placed-in-service date. EC status is PIS-date-determined for ITC."
+    )
+
+# Stack calc-engine + cross-cut warnings together
+all_warnings = list(out.warnings) + cross_warnings
+if all_warnings:
+    for w in all_warnings:
+        st.warning(w)
+else:
+    st.success("No sanity warnings flagged.")
 
 
 # ---------- PDF deal-analysis export ----------
