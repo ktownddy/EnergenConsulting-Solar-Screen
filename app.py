@@ -215,7 +215,7 @@ f.fixed_om_per_kw_year = c3.number_input("Fixed O&M ($/kWdc-yr)", value=float(f.
 
 # ---------- 2. Revenue ----------
 st.markdown("### Revenue side")
-c1, c2, c3 = st.columns(3)
+c1, c2, c3, c4 = st.columns(4)
 if f.owner_mode == "Customer-owned":
     f.customer_current_rate = c1.number_input(
         "Customer's current utility rate ($/kWh)",
@@ -240,6 +240,12 @@ esc_pct = c3.number_input(
     help="Free-form decimal. e.g. 2.27 means 2.27%/yr.",
 )
 f.rate_escalator = esc_pct / 100.0
+
+f.term_years = c4.number_input(
+    "Analysis term (years)",
+    value=int(f.term_years), step=1, min_value=5, max_value=40,
+    help="Typical PPA/ESA terms: 15-25 years. Federal ESPC ESA max = 20.",
+)
 
 
 # ---------- 3. Tax credit Q&A ----------
@@ -389,9 +395,18 @@ st.markdown(
 
 
 # ---------- Headline cards ----------
+# Equity math:
+#   Equity at close = CapEx the sponsor/investor has to fund up front, minus any senior debt
+#   Net equity after Yr 1 = after the ITC cash + depreciation tax shield clear
+#                          (this is the real residual cash-at-risk; can be near zero or negative)
+equity_at_close = out.total_capex - (out.debt_amount if f.debt_enabled else 0.0)
+year1_tax_benefits = out.itc_cash_year1 + out.bonus_dep_shield_year1
+net_equity_after_yr1 = equity_at_close - year1_tax_benefits
+
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Total CapEx", _fmt_money(out.total_capex))
-c2.metric("Simple payback", f"Yr {out.simple_payback_year}" if out.simple_payback_year else "Never")
+c2.metric("Equity at close", _fmt_money(equity_at_close),
+          help="What you (or your investor) write at financial close. CapEx minus senior debt.")
 c3.metric("After-TC payback", f"Yr {out.after_tc_payback_year}" if out.after_tc_payback_year else "Never")
 headline_irr = out.levered_irr if out.levered_irr is not None else out.unlevered_irr
 irr_label = "Levered IRR" if f.debt_enabled and out.debt_amount > 0 else "IRR (post-tax-credit)"
@@ -400,8 +415,22 @@ c4.metric(irr_label, _fmt_pct(headline_irr))
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Year-1 production", f"{out.year1_production_kwh/1000:,.0f} MWh")
 c2.metric("Year-1 revenue/savings", _fmt_money(out.year1_revenue_or_savings))
-c3.metric("LCOE (simple)", f"${out.lcoe:.4f}/kWh")
-c4.metric("ITC + dep shield Yr 1", _fmt_money(out.itc_cash_year1 + out.bonus_dep_shield_year1))
+c3.metric(
+    "Net equity after Yr 1",
+    _fmt_money(net_equity_after_yr1),
+    delta=f"{-year1_tax_benefits/1e6:+.2f}M tax benefits" if year1_tax_benefits > 0 else None,
+    delta_color="inverse",
+    help=("Equity at close minus the Year-1 ITC cash + depreciation tax shield. "
+          "This is the real residual cash exposure. Can be near zero or negative for tax-rich deals."),
+)
+c4.metric("ITC + dep shield Yr 1", _fmt_money(year1_tax_benefits))
+
+# Third row: production-detail + LCOE + simple payback
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Simple payback (no TC)", f"Yr {out.simple_payback_year}" if out.simple_payback_year else "Never")
+c2.metric("LCOE (simple)", f"${out.lcoe:.4f}/kWh")
+c3.write("")
+c4.write("")
 
 # Debt row, only when debt is on
 if f.debt_enabled and out.debt_amount > 0:
