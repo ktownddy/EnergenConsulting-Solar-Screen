@@ -94,8 +94,12 @@ class SnapshotInputs:
     ppa_rate_to_customer: float = 0.085
     rate_escalator: float = 0.0250
 
-    # Operating
-    fixed_om_per_kw_year: float = 12.0
+    # Operating — broken out for transparency
+    fixed_om_per_kw_year: float = 12.0       # bundled O&M, $/kWdc-yr
+    land_lease_annual: float = 0.0           # $/yr (often 0 for rooftop)
+    property_tax_annual: float = 0.0         # $/yr (state/local dependent)
+    other_opex_annual: float = 0.0           # insurance, asset mgmt, misc, $/yr
+    opex_escalation: float = 0.025            # annual inflation on OpEx
     degradation_pct: float = 0.005
     term_years: int = 25
 
@@ -126,6 +130,7 @@ class SnapshotOutputs:
     annual_revenue: List[float]
     annual_opex: List[float]
     annual_ebitda: List[float]
+    opex_year1_breakdown: dict
 
     # Tax credit
     itc_cash_year1: float
@@ -169,12 +174,21 @@ def calculate_snapshot(inp: SnapshotInputs) -> SnapshotOutputs:
     # ---- Revenue ----
     rate_yr1 = inp.customer_current_rate if inp.owner_mode == "Customer-owned" else inp.ppa_rate_to_customer
 
+    # Year-1 OpEx breakdown — useful for the dashboard and PDF
+    opex_year1_breakdown = {
+        "Fixed O&M": inp.size_kw_dc * inp.fixed_om_per_kw_year,
+        "Land lease": inp.land_lease_annual,
+        "Property tax": inp.property_tax_annual,
+        "Other (insurance / asset mgmt / misc)": inp.other_opex_annual,
+    }
+    opex_year1_total = sum(opex_year1_breakdown.values())
+
     annual_revenue, annual_opex, annual_ebitda = [], [], []
     for y in range(inp.term_years):
         production = year1_production * ((1.0 - inp.degradation_pct) ** y)
         rate = rate_yr1 * ((1.0 + inp.rate_escalator) ** y)
         rev = production * rate
-        opex = inp.size_kw_dc * inp.fixed_om_per_kw_year * ((1.0 + 0.025) ** y)
+        opex = opex_year1_total * ((1.0 + inp.opex_escalation) ** y)
         annual_revenue.append(rev)
         annual_opex.append(opex)
         annual_ebitda.append(rev - opex)
@@ -390,6 +404,7 @@ def calculate_snapshot(inp: SnapshotInputs) -> SnapshotOutputs:
         annual_revenue=annual_revenue,
         annual_opex=annual_opex,
         annual_ebitda=annual_ebitda,
+        opex_year1_breakdown=opex_year1_breakdown,
         itc_cash_year1=itc_cash_year1,
         bonus_dep_shield_year1=bonus_dep_shield_year1,
         unlevered_cash_flow=unlevered_cf,

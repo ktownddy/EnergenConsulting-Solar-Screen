@@ -24,6 +24,7 @@ from snapshot_calc import (
     DEFAULT_YIELDS,
     DEFAULT_OM,
 )
+from pdf_export import build_deal_pdf
 
 
 # ---------- Brand palette (matched to logo) ----------
@@ -210,7 +211,24 @@ c1, c2, c3 = st.columns(3)
 f.size_kw_dc = c1.number_input("System size (kWdc)", value=float(f.size_kw_dc), step=50.0,
                                 help="Typical Energen deal: 750 kW – 10 MW.")
 f.cost_per_watt = c2.number_input("Cost per watt ($/Wdc)", value=float(f.cost_per_watt), step=0.10)
-f.fixed_om_per_kw_year = c3.number_input("Fixed O&M ($/kWdc-yr)", value=float(f.fixed_om_per_kw_year), step=1.0)
+f.fixed_om_per_kw_year = c3.number_input("Fixed O&M ($/kWdc-yr)", value=float(f.fixed_om_per_kw_year), step=1.0,
+                                          help="Bundled annual O&M cost per kW. Land lease, property tax, and other expenses are separate below.")
+
+# Additional operating expenses, broken out
+st.markdown("##### Other annual operating expenses")
+c1, c2, c3 = st.columns(3)
+f.land_lease_annual = c1.number_input(
+    "Land lease ($/yr)", value=float(f.land_lease_annual), step=1000.0,
+    help="Typical: $0 for rooftop, $500-$2,000/acre/yr for ground-mount in commercial-friendly states.",
+)
+f.property_tax_annual = c2.number_input(
+    "Property tax ($/yr)", value=float(f.property_tax_annual), step=1000.0,
+    help="State / local dependent. Many states exempt or partially exempt solar.",
+)
+f.other_opex_annual = c3.number_input(
+    "Other expenses ($/yr)", value=float(f.other_opex_annual), step=1000.0,
+    help="Insurance, asset management, monitoring, environmental compliance, misc.",
+)
 
 
 # ---------- 2. Revenue ----------
@@ -300,6 +318,41 @@ else:
     f.itc_pct = itc_pct
     pieces = " + ".join(f"{name} {v*100:.0f}%" for name, v in components.items())
     st.info(f"**Applicable Section 48E credit: {itc_pct*100:.1f}%** ({pieces})")
+
+    # ---- ITC monetization (transferability sell price) ----
+    if f.owner_mode == "Developer-PPA":
+        st.markdown("##### How is the ITC monetized?")
+        c1, c2, c3 = st.columns(3)
+        sell_pct = c1.number_input(
+            "ITC sell price (¢ per $1 of credit)",
+            value=float(f.transfer_sale_price) * 100.0,
+            step=0.5, format="%.2f",
+            help=("Mid-2026 IG benchmark per Crux: ~93¢. Non-IG ~$82-90. "
+                  "FEOC-clean projects price ~$0.02-0.03 above market."),
+        )
+        f.transfer_sale_price = sell_pct / 100.0
+        txn_pct = c2.number_input(
+            "Transaction cost (%)",
+            value=float(f.transfer_transaction_cost_pct) * 100.0,
+            step=0.5, format="%.2f",
+            help="Legal, insurance, broker fee. Typical 1-3%.",
+        )
+        f.transfer_transaction_cost_pct = txn_pct / 100.0
+        recapture_pct = c3.number_input(
+            "Recapture reserve / holdback (%)",
+            value=float(f.recapture_reserve_pct) * 100.0,
+            step=0.5, format="%.2f",
+            help="Buyer holdback against 5-yr recapture risk. Typical 5-10%.",
+        )
+        f.recapture_reserve_pct = recapture_pct / 100.0
+        gross_credit = (f.size_kw_dc * 1000 * f.cost_per_watt) * f.itc_pct
+        net_proceeds = gross_credit * f.transfer_sale_price * (1 - f.transfer_transaction_cost_pct - f.recapture_reserve_pct)
+        st.caption(
+            f"Gross §48E credit: **{_fmt_money(gross_credit)}**  →  "
+            f"sold at {f.transfer_sale_price*100:.1f}¢  →  "
+            f"less {(f.transfer_transaction_cost_pct + f.recapture_reserve_pct)*100:.1f}% costs/holdback  "
+            f"=  **net cash {_fmt_money(net_proceeds)}**"
+        )
 
 
 # ---------- 4. Depreciation ----------
@@ -464,6 +517,59 @@ else:
     )
 
 
+# ---------- Sources & Uses waterfall ----------
+st.markdown("### Where the money comes from")
+st.caption("How CapEx is funded — bar shows total project cost, then each layer of capital and Year-1 tax benefit that closes the gap.")
+
+# Waterfall components — positive contributors that fund the CapEx
+funding_labels = ["Total CapEx"]
+funding_values = [out.total_capex]
+funding_measures = ["absolute"]
+
+if f.debt_enabled and out.debt_amount > 0:
+    funding_labels.append("Senior debt")
+    funding_values.append(-out.debt_amount)
+    funding_measures.append("relative")
+
+if out.itc_cash_year1 > 0:
+    funding_labels.append("ITC cash (Yr 1)")
+    funding_values.append(-out.itc_cash_year1)
+    funding_measures.append("relative")
+
+if out.bonus_dep_shield_year1 > 0:
+    funding_labels.append("Depreciation tax shield (Yr 1)")
+    funding_values.append(-out.bonus_dep_shield_year1)
+    funding_measures.append("relative")
+
+# What's left = the net residual equity exposure
+residual = out.total_capex - (out.debt_amount if f.debt_enabled else 0) - out.itc_cash_year1 - out.bonus_dep_shield_year1
+funding_labels.append("Net equity at risk")
+funding_values.append(residual)
+funding_measures.append("total")
+
+waterfall = go.Figure(go.Waterfall(
+    name="Funding stack",
+    orientation="v",
+    measure=funding_measures,
+    x=funding_labels,
+    y=funding_values,
+    text=[f"${v/1e6:,.2f}M" for v in funding_values],
+    textposition="outside",
+    connector={"line": {"color": TAN}},
+    decreasing={"marker": {"color": GOLD}},
+    increasing={"marker": {"color": NAVY}},
+    totals={"marker": {"color": NAVY_LIGHT}},
+))
+waterfall.update_layout(
+    height=380,
+    margin=dict(l=10, r=10, t=20, b=20),
+    plot_bgcolor=PARCHMENT, paper_bgcolor=PARCHMENT,
+    yaxis_title="$",
+    showlegend=False,
+)
+st.plotly_chart(waterfall, use_container_width=True)
+
+
 # ---------- Cumulative cash chart ----------
 headline_cum = out.cumulative_levered_cf if (f.debt_enabled and out.debt_amount > 0) else out.cumulative_unlevered_cf
 years_axis = list(range(0, len(headline_cum)))
@@ -584,6 +690,25 @@ else:
         f"No {rate_label} in the 0c–50c/kWh range delivers {target_irr_pct:.1f}% IRR "
         "at these CapEx + opex assumptions. CapEx or yield needs to move."
     )
+
+
+# ---------- PDF deal-analysis export ----------
+st.divider()
+st.markdown("### Export deal analysis")
+st.caption("Generate a single-page PDF deal sheet with all the inputs, outputs, and tax-credit stack. Use to share with investors, lenders, or internal review.")
+
+try:
+    pdf_bytes = build_deal_pdf(f, out, q)
+    project_label = inp_label = f"{f.project_type}_{f.size_kw_dc:.0f}kW".replace(" ", "_").replace("(", "").replace(")", "")
+    st.download_button(
+        label="Download deal analysis PDF",
+        data=pdf_bytes,
+        file_name=f"Energen_Solar_Deal_Snapshot_{project_label}.pdf",
+        mime="application/pdf",
+        use_container_width=True,
+    )
+except Exception as e:
+    st.warning(f"PDF generation failed: {e}. Refresh the page; if it persists, let us know.")
 
 
 # ---------- Footer ----------
