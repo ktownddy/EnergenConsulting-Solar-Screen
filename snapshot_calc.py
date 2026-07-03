@@ -102,7 +102,8 @@ class SnapshotInputs:
     project_type: str = "Ground (fixed-tilt)"
     owner_mode: str = "Developer-PPA"              # "Customer-owned" | "Developer-PPA"
     size_kw_dc: float = 58850.0
-    cost_per_watt: float = 1.84
+    cost_per_watt: float = 1.84                    # module/BOS/soft-cost stack, $/Wdc
+    interconnection_cost: float = 0.0              # separate lump-sum add-on
     yield_kwh_per_kw: float = 1433.0
 
     # Revenue (bundled energy + REC rate — do not double-count RECs separately)
@@ -111,13 +112,24 @@ class SnapshotInputs:
     rate_escalator: float = 0.0125                  # 1.25% / yr
 
     # Operating — broken out for transparency
-    fixed_om_per_kw_year: float = 6.38              # $/kWdc-yr (≈ $375K/yr at 58.85 MWdc)
+    # Fixed O&M can be entered either as $/kWdc-yr (industry-standard benchmark)
+    # OR as a total $/yr lump sum. `fixed_om_entry_mode` toggles which field is used.
+    fixed_om_entry_mode: str = "$/kWdc-yr"          # "$/kWdc-yr" | "$/yr"
+    fixed_om_per_kw_year: float = 6.38              # used when mode == "$/kWdc-yr"
+    fixed_om_annual: float = 0.0                    # used when mode == "$/yr"
     land_lease_annual: float = 203_626.0
     property_tax_annual: float = 148_609.0
     other_opex_annual: float = 262_364.0
     opex_escalation: float = 0.025
     degradation_pct: float = 0.005
     term_years: int = 25
+
+    # Terminal / residual value at end of analysis term (rule of thumb: 5–15% of CapEx
+    # for 20-yr operating solar; 0 = conservative screen).
+    terminal_value: float = 0.0
+
+    # Sponsor / developer equity share of the equity check (rest goes to outside LP).
+    sponsor_equity_pct: float = 0.20
 
     # Tax & credit
     itc_pct: float = 0.40                           # 30% base + 10pp from Energy Community
@@ -179,6 +191,11 @@ class SnapshotOutputs:
     lcoe: float
     revenue_avg: float
 
+    # Equity split + operating-year cash yield
+    sponsor_cash: float                # dollars the developer/sponsor writes
+    outside_lp_equity: float           # dollars the outside LP needs to write
+    cash_on_cash_yield: Optional[float]  # avg operating-year distribution / equity at close
+
     verdict: str
     warnings: List[str] = field(default_factory=list)
 
@@ -188,15 +205,22 @@ class SnapshotOutputs:
 def calculate_snapshot(inp: SnapshotInputs) -> SnapshotOutputs:
     warnings: List[str] = []
 
-    total_capex = inp.size_kw_dc * 1000.0 * inp.cost_per_watt
+    # Total CapEx = system cost + interconnection add-on. cost_per_watt is the
+    # $/Wdc benchmark for modules/BOS/soft costs (not including interconnection).
+    total_capex = inp.size_kw_dc * 1000.0 * inp.cost_per_watt + inp.interconnection_cost
     year1_production = inp.size_kw_dc * inp.yield_kwh_per_kw
 
     # ---- Revenue ----
     rate_yr1 = inp.customer_current_rate if inp.owner_mode == "Customer-owned" else inp.ppa_rate_to_customer
 
-    # Year-1 OpEx breakdown — useful for the dashboard and PDF
+    # Year-1 OpEx breakdown — useful for the dashboard and PDF.
+    # Fixed O&M is entered either per-kW or as a lump sum; use whichever mode is active.
+    if inp.fixed_om_entry_mode == "$/yr":
+        fixed_om = inp.fixed_om_annual
+    else:  # default "$/kWdc-yr"
+        fixed_om = inp.size_kw_dc * inp.fixed_om_per_kw_year
     opex_year1_breakdown = {
-        "Fixed O&M": inp.size_kw_dc * inp.fixed_om_per_kw_year,
+        "Fixed O&M": fixed_om,
         "Land lease": inp.land_lease_annual,
         "Property tax": inp.property_tax_annual,
         "Other (insurance / asset mgmt / misc)": inp.other_opex_annual,
@@ -228,6 +252,7 @@ def calculate_snapshot(inp: SnapshotInputs) -> SnapshotOutputs:
 
     # ---- Optional debt sizing ----
     debt_amount = 0.0
+    balloon_payoff_final = 0.0
     annual_interest = [0.0] * inp.term_years
     annual_principal = [0.0] * inp.term_years
     annual_debt_service = [0.0] * inp.term_years
@@ -270,6 +295,18 @@ def calculate_snapshot(inp: SnapshotInputs) -> SnapshotOutputs:
             annual_principal[y] = principal
             annual_debt_service[y] = interest + principal
             balance -= principal
+
+        # If the amortization term runs past the analysis term, a balance remains at
+        # the end. Treat it as a balloon payoff deducted from the final-year levered
+        # cash flow (kept OUT of the DSCR arrays — it's a refinance/payoff event, not
+        # an operating coverage burden) so levered returns aren't overstated.
+        balloon_payoff_final = balance if balance > 0.01 else 0.0
+        if balloon_payoff_final > 0:
+            warnings.append(
+                f"Amortization ({inp.amortization_years} yr) extends beyond the analysis term "
+                f"({inp.term_years} yr). Remaining balance of ${balloon_payoff_final/1e6:.2f}M is "
+                "deducted from the final year as a balloon payoff."
+            )
 
         # DSCR per year
         for y in range(inp.term_years):
@@ -329,8 +366,20 @@ def calculate_snapshot(inp: SnapshotInputs) -> SnapshotOutputs:
                 tax = (operating - interest_paid) * inp.tax_rate
                 after_tax = operating - ds - tax
             levered_cf.append(after_tax)
+        # Balloon payoff of any balance remaining past the analysis term
+        if balloon_payoff_final > 0:
+            levered_cf[-1] -= balloon_payoff_final
     else:
         levered_cf = list(unlevered_cf)
+
+    # Terminal / residual value at end of analysis term.
+    # Added to the final year of both unlevered and levered streams (post-tax simplification —
+    # for a screening tool, we treat terminal value as an after-tax cash number the user has
+    # already scoped for themselves).
+    if inp.terminal_value > 0 and len(unlevered_cf) > 1:
+        unlevered_cf[-1] += inp.terminal_value
+        if len(levered_cf) > 1:
+            levered_cf[-1] += inp.terminal_value
 
     # Cumulative
     cum_unlev = []
@@ -366,6 +415,29 @@ def calculate_snapshot(inp: SnapshotInputs) -> SnapshotOutputs:
     total_cost_for_lcoe = total_capex + sum(annual_opex)
     lcoe = total_cost_for_lcoe / total_kwh if total_kwh > 0 else 0.0
     revenue_avg = sum(annual_revenue) / inp.term_years if annual_revenue else 0.0
+
+    # ---- Sponsor / outside LP equity split ----
+    equity_at_close = total_capex - (debt_amount if inp.debt_enabled else 0.0)
+    sponsor_share = max(0.0, min(1.0, inp.sponsor_equity_pct))
+    sponsor_cash = equity_at_close * sponsor_share
+    outside_lp_equity = equity_at_close - sponsor_cash
+
+    # ---- Cash-on-cash yield (operating years) ----
+    # Average of Years 2..N distributions divided by the equity at close. Year 1 is
+    # excluded because it contains the outsized ITC + depreciation shield receipts —
+    # for a yield metric, we want the steady-state operating distribution level.
+    hl_cf = levered_cf if (inp.debt_enabled and debt_amount > 0) else unlevered_cf
+    if len(hl_cf) > 2 and equity_at_close > 0:
+        # hl_cf[0] = -equity at close; hl_cf[1] = Year 1 (has ITC + dep bump); we skip both
+        # for the yield calc unless there are only a couple of years total.
+        operating_flows = hl_cf[2:]
+        # If a terminal value was tacked onto the last year, strip it out for yield purposes
+        # so it doesn't inflate the average.
+        if inp.terminal_value > 0 and operating_flows:
+            operating_flows = operating_flows[:-1] + [operating_flows[-1] - inp.terminal_value]
+        cash_on_cash_yield = (sum(operating_flows) / len(operating_flows)) / equity_at_close
+    else:
+        cash_on_cash_yield = None
 
     # ---- Verdict ----
     bits: List[str] = []
@@ -485,6 +557,9 @@ def calculate_snapshot(inp: SnapshotInputs) -> SnapshotOutputs:
         levered_irr=lev_irr,
         lcoe=lcoe,
         revenue_avg=revenue_avg,
+        sponsor_cash=sponsor_cash,
+        outside_lp_equity=outside_lp_equity,
+        cash_on_cash_yield=cash_on_cash_yield,
         verdict=verdict,
         warnings=warnings,
     )

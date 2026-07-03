@@ -40,7 +40,7 @@ PARCHMENT = "#fbfaf6"
 
 st.set_page_config(
     page_title="Energen Solar Deal Snapshot",
-    page_icon=None,
+    page_icon="☀️",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
@@ -187,6 +187,55 @@ f: SnapshotInputs = st.session_state.snap
 q = st.session_state.itc_q
 
 
+# ---------- Save / load deal (JSON) ----------
+with st.expander("Save or load a deal", expanded=False):
+    import json as _json
+    from dataclasses import asdict as _asdict
+
+    st.caption("Save your current inputs to a JSON file, or load a previously-saved deal.")
+    c1, c2 = st.columns(2)
+
+    # Save button
+    _serial = _asdict(f)
+    _serial["_itc_questions"] = q  # persist the tax-credit Q&A too
+    _json_bytes = _json.dumps(_serial, indent=2).encode("utf-8")
+    project_slug = f"{f.project_type}_{f.size_kw_dc:.0f}kW".replace(" ", "_").replace("(", "").replace(")", "")
+    c1.download_button(
+        label="Save this deal as JSON",
+        data=_json_bytes,
+        file_name=f"Energen_deal_{project_slug}.json",
+        mime="application/json",
+        width="stretch",
+    )
+
+    # Load uploader — apply each uploaded file exactly ONCE. Without the signature
+    # guard, the uploader stays "full" across reruns and would silently re-load the
+    # JSON on every subsequent input change, overwriting the user's edits.
+    upl = c2.file_uploader("Load a saved deal", type=["json"], label_visibility="visible")
+    if upl is not None:
+        _raw = upl.read()
+        import hashlib as _hashlib
+        _sig = _hashlib.md5(_raw).hexdigest()
+        if st.session_state.get("_loaded_deal_sig") != _sig:
+            try:
+                loaded = _json.loads(_raw.decode("utf-8"))
+                loaded_itc = loaded.pop("_itc_questions", None)
+                # Filter to fields SnapshotInputs actually accepts
+                valid_fields = set(SnapshotInputs.__dataclass_fields__.keys())
+                filtered = {k: v for k, v in loaded.items() if k in valid_fields}
+                st.session_state.snap = SnapshotInputs(**filtered)
+                if loaded_itc:
+                    st.session_state.itc_q = loaded_itc
+                # Sync the depreciation radio to the loaded deal
+                _s = st.session_state.snap
+                st.session_state["dep_radio"] = "Yes" if (_s.bonus_depreciation_pct > 0 or _s.tax_rate > 0) else "No"
+                st.session_state["_loaded_deal_sig"] = _sig
+                st.success("Deal loaded.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Could not load JSON file: {e}")
+
+
 # ---------- 1. Owner mode + project type ----------
 st.markdown("### Project basics")
 c1, c2, c3 = st.columns([1.2, 1.2, 1])
@@ -205,22 +254,48 @@ f.yield_kwh_per_kw = c3.number_input(
     "Yield (kWh/kWdc-yr)",
     value=float(f.yield_kwh_per_kw),
     step=50.0,
+    min_value=100.0,
     help="Defaults: Carport 1,300 / Rooftop 1,400 / Ground-fixed 1,500 / Ground-tracking 1,800",
 )
 
 c1, c2, c3 = st.columns(3)
 f.size_kw_dc = c1.number_input("System size (kWdc)", value=float(f.size_kw_dc), step=50.0,
-                                help="Typical Energen deal: 750 kW – 10 MW.")
-f.cost_per_watt = c2.number_input("Cost per watt ($/Wdc)", value=float(f.cost_per_watt), step=0.10)
-f.fixed_om_per_kw_year = c3.number_input("Fixed O&M ($/kWdc-yr)", value=float(f.fixed_om_per_kw_year), step=1.0,
-                                          help="Bundled annual O&M cost per kW. Land lease, property tax, and other expenses are separate below.")
+                                min_value=1.0,
+                                help="Typical Energen deal: 750 kW – 60 MW.")
+f.cost_per_watt = c2.number_input("Cost per watt ($/Wdc)", value=float(f.cost_per_watt), step=0.05,
+                                   min_value=0.01,
+                                   help="Module + BOS + soft costs. Interconnection is entered separately below.")
+f.interconnection_cost = c3.number_input(
+    "Interconnection cost ($)", value=float(f.interconnection_cost), step=25_000.0,
+    min_value=0.0,
+    help="Lump-sum for interconnection facilities, upgrades, PJM/CAISO/ERCOT costs. Adds to Total CapEx.",
+)
 
-# Additional operating expenses, broken out
+# Fixed O&M — user can enter as $/kWdc-yr (industry benchmark) OR as a total $/yr lump sum
+st.markdown("##### Fixed O&M")
+c1, c2 = st.columns([1, 2])
+f.fixed_om_entry_mode = c1.radio(
+    "Entry mode", ["$/kWdc-yr", "$/yr"],
+    index=["$/kWdc-yr", "$/yr"].index(f.fixed_om_entry_mode),
+    horizontal=True,
+)
+if f.fixed_om_entry_mode == "$/kWdc-yr":
+    f.fixed_om_per_kw_year = c2.number_input(
+        "Fixed O&M ($/kWdc-yr)", value=float(f.fixed_om_per_kw_year), step=0.10,
+        help=f"At {f.size_kw_dc:,.0f} kWdc, this is ${f.size_kw_dc * f.fixed_om_per_kw_year:,.0f}/yr total.",
+    )
+else:
+    f.fixed_om_annual = c2.number_input(
+        "Fixed O&M ($/yr)", value=float(f.fixed_om_annual), step=5_000.0,
+        help=f"At {f.size_kw_dc:,.0f} kWdc, this implies ${(f.fixed_om_annual/max(f.size_kw_dc,1)):.2f}/kWdc-yr.",
+    )
+
+# Additional operating expenses, broken out (all annual dollar amounts)
 st.markdown("##### Other annual operating expenses")
 c1, c2, c3 = st.columns(3)
 f.land_lease_annual = c1.number_input(
     "Land lease ($/yr)", value=float(f.land_lease_annual), step=1000.0,
-    help="Typical: $0 for rooftop, $500-$2,000/acre/yr for ground-mount in commercial-friendly states.",
+    help="Typical: $0 for rooftop, $500–$2,000/acre/yr for ground-mount.",
 )
 f.property_tax_annual = c2.number_input(
     "Property tax ($/yr)", value=float(f.property_tax_annual), step=1000.0,
@@ -294,6 +369,13 @@ else:
         c2.success("PWA exempt (<1 MWac)")
         q["pwa_direct"] = True
     else:
+        # Helpful nudge: at a typical ~1.25 DC/AC ratio, systems under ~1,250 kWdc
+        # are likely under 1 MWac and may qualify for the small-project exemption.
+        if f.size_kw_dc < 1250:
+            c1.caption(
+                "This system may be under 1 MWac (at a typical 1.25 DC/AC ratio) — "
+                "check the inverter nameplate; the small-project exemption may apply."
+            )
         q["pwa_direct"] = c2.radio(
             "Is PWA compliance met?",
             ["Yes", "No"], index=0 if q["pwa_direct"] else 1, horizontal=True,
@@ -346,7 +428,8 @@ else:
             help="Buyer holdback against 5-yr recapture risk. Typical 5-10%.",
         )
         f.recapture_reserve_pct = recapture_pct / 100.0
-        gross_credit = (f.size_kw_dc * 1000 * f.cost_per_watt) * f.itc_pct
+        # Match the calc engine's basis: system cost PLUS interconnection.
+        gross_credit = (f.size_kw_dc * 1000 * f.cost_per_watt + f.interconnection_cost) * f.itc_pct
         net_proceeds = gross_credit * f.transfer_sale_price * (1 - f.transfer_transaction_cost_pct - f.recapture_reserve_pct)
         st.caption(
             f"Gross §48E credit: **{_fmt_money(gross_credit)}**  →  "
@@ -360,16 +443,24 @@ else:
 st.markdown("### Depreciation")
 who = "the customer" if f.owner_mode == "Customer-owned" else "the developer entity"
 c1, c2 = st.columns(2)
+# Remember the last non-zero tax rate so toggling No -> Yes restores it instead of 0%.
+if f.tax_rate > 0:
+    st.session_state["_last_tax_rate"] = f.tax_rate
+# Stable-keyed radio: initialize once from state (so a loaded "no depreciation" deal
+# restores correctly — the JSON loader sets this key), then let the widget own it.
+if "dep_radio" not in st.session_state:
+    st.session_state["dep_radio"] = "Yes" if (f.bonus_depreciation_pct > 0 or f.tax_rate > 0) else "No"
 can_use_dep = c1.radio(
     f"Can {who} use the depreciation (sufficient tax appetite)?",
-    ["Yes", "No"], index=0, horizontal=True,
+    ["Yes", "No"], horizontal=True, key="dep_radio",
     help=("Yes = 100% bonus depreciation Year 1 + tax on operating income. "
           "No = no depreciation shield, no operating tax (tax-exempt owner)."),
 ) == "Yes"
 if can_use_dep:
+    _tax_default = f.tax_rate if f.tax_rate > 0 else st.session_state.get("_last_tax_rate", 0.27)
     tax_pct = c2.number_input(
         "Combined tax rate (%)",
-        value=float(f.tax_rate) * 100.0,
+        value=float(_tax_default) * 100.0,
         step=0.01,
         format="%.4f",
     )
@@ -416,17 +507,37 @@ if f.debt_enabled:
     int_rate = c3.number_input(
         "Interest rate (%)",
         value=float(f.interest_rate) * 100.0,
-        step=0.05, format="%.4f",
+        step=0.05, format="%.4f", min_value=0.0,
     )
     f.interest_rate = int_rate / 100.0
     c4_a, c4_b = c4.columns(2)
-    f.amortization_years = c4_a.number_input("Amort (yr)", value=int(f.amortization_years), step=1)
+    f.amortization_years = c4_a.number_input("Amort (yr)", value=int(f.amortization_years), step=1, min_value=1, max_value=40)
     dscr_floor = c4_b.number_input(
         "Min DSCR",
         value=float(f.min_dscr_requirement),
         step=0.05, format="%.2f",
     )
     f.min_dscr_requirement = dscr_floor
+
+
+# ---------- 6. Equity structure and terminal value ----------
+st.markdown("### Equity structure and terminal value")
+c1, c2 = st.columns(2)
+sponsor_pct = c1.number_input(
+    "Sponsor / developer equity share (%)",
+    value=float(f.sponsor_equity_pct) * 100.0,
+    step=1.0, format="%.1f", min_value=0.0, max_value=100.0,
+    help=("What share of the equity check the developer / sponsor covers. Balance is outside-LP equity. "
+          "Splits the equity number pro-rata; does not model pref or promote."),
+)
+f.sponsor_equity_pct = sponsor_pct / 100.0
+
+f.terminal_value = c2.number_input(
+    "Terminal / residual value at end of term ($)",
+    value=float(f.terminal_value), step=100_000.0, min_value=0.0,
+    help=("Residual PPA-extension value, land sale, or asset resale. Set 0 for conservative screen. "
+          "Rule of thumb for 20-yr operating solar: 5–15% of original CapEx."),
+)
 
 
 # ---------- Calculate ----------
@@ -446,6 +557,11 @@ st.markdown(
     f'<div class="{verdict_class}">Verdict: {out.verdict}</div>',
     unsafe_allow_html=True,
 )
+if out.warnings:
+    st.caption(
+        f"⚠ {len(out.warnings)} sanity {'warning' if len(out.warnings) == 1 else 'warnings'} "
+        "flagged — full detail in the Sanity Warnings section near the bottom of the page."
+    )
 
 
 # ---------- Headline cards ----------
@@ -491,12 +607,25 @@ c3.metric("Yr-1 tax benefits", _fmt_money(itc_cash_yr1 + dep_shield_yr1),
           help="ITC cash + depreciation tax shield combined. The cash piece is the ITC; the dep shield is tax-only.")
 c4.metric("LCOE (simple)", f"${out.lcoe:.4f}/kWh")
 
-# Simple payback row
+# Sponsor split + operating yield row
 c1, c2, c3, c4 = st.columns(4)
-c1.metric("Simple payback (no TC)", f"Yr {out.simple_payback_year}" if out.simple_payback_year else "Never")
-c2.write("")
-c3.write("")
-c4.write("")
+c1.metric(
+    "Sponsor cash (skin-in-the-game)",
+    _fmt_money(out.sponsor_cash),
+    help=f"{f.sponsor_equity_pct*100:.0f}% of the equity check. This is what the developer / sponsor writes.",
+)
+c2.metric(
+    "Outside LP equity to raise",
+    _fmt_money(out.outside_lp_equity),
+    help=f"The remaining {(1-f.sponsor_equity_pct)*100:.0f}% of the equity check. This is what needs to be raised from an outside investor.",
+)
+c3.metric(
+    "Cash-on-cash yield (operating avg)",
+    _fmt_pct(out.cash_on_cash_yield),
+    help=("Average annual distribution during operating years (excludes Year 1's ITC + dep bump) "
+          "divided by equity at close. Key metric for yield-oriented LPs like family offices."),
+)
+c4.metric("Simple payback (no TC)", f"Yr {out.simple_payback_year}" if out.simple_payback_year else "Never")
 
 # Debt row, only when debt is on
 if f.debt_enabled and out.debt_amount > 0:
@@ -584,7 +713,7 @@ waterfall.update_layout(
     yaxis_title="$",
     showlegend=False,
 )
-st.plotly_chart(waterfall, use_container_width=True)
+st.plotly_chart(waterfall, width="stretch")
 
 
 # ---------- Cumulative cash chart ----------
@@ -610,7 +739,7 @@ fig.update_layout(
     height=380, margin=dict(l=10, r=10, t=40, b=10),
     plot_bgcolor=PARCHMENT, paper_bgcolor=PARCHMENT,
 )
-st.plotly_chart(fig, use_container_width=True)
+st.plotly_chart(fig, width="stretch")
 
 
 # ---------- DSCR chart (only if debt is on) ----------
@@ -645,7 +774,7 @@ if f.debt_enabled and out.debt_amount > 0:
         height=320, margin=dict(l=10, r=10, t=40, b=10),
         plot_bgcolor=PARCHMENT, paper_bgcolor=PARCHMENT,
     )
-    st.plotly_chart(fig2, use_container_width=True)
+    st.plotly_chart(fig2, width="stretch")
 
 
 # Warnings are surfaced in a dedicated section below the scenario comparison.
@@ -855,7 +984,7 @@ scenario_df = pd.DataFrame({
     f"Target (${sc_target:.2f}/W)": _run_case(sc_target),
     f"Low-cost (${sc_low:.2f}/W)": _run_case(sc_low),
 })
-st.dataframe(scenario_df, use_container_width=True)
+st.dataframe(scenario_df, width="stretch")
 
 
 # ============================================================
@@ -907,13 +1036,13 @@ st.caption("Generate a single-page PDF deal sheet with all the inputs, outputs, 
 
 try:
     pdf_bytes = build_deal_pdf(f, out, q)
-    project_label = inp_label = f"{f.project_type}_{f.size_kw_dc:.0f}kW".replace(" ", "_").replace("(", "").replace(")", "")
+    project_label = f"{f.project_type}_{f.size_kw_dc:.0f}kW".replace(" ", "_").replace("(", "").replace(")", "")
     st.download_button(
         label="Download deal analysis PDF",
         data=pdf_bytes,
         file_name=f"Energen_Solar_Deal_Snapshot_{project_label}.pdf",
         mime="application/pdf",
-        use_container_width=True,
+        width="stretch",
     )
 except Exception as e:
     st.warning(f"PDF generation failed: {e}. Refresh the page; if it persists, let us know.")

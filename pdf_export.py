@@ -152,6 +152,10 @@ def build_deal_pdf(inp, out, q: dict) -> bytes:
         ["Ownership / structure", inp.owner_mode],
         ["System size (DC)", f"{inp.size_kw_dc:,.0f} kWdc"],
         ["Cost per watt", f"${inp.cost_per_watt:,.2f}/Wdc"],
+    ]
+    if inp.interconnection_cost > 0:
+        summary_rows.append(["Interconnection cost", _fmt_money(inp.interconnection_cost)])
+    summary_rows += [
         ["Specific yield", f"{inp.yield_kwh_per_kw:,.0f} kWh/kWdc-yr"],
         ["Analysis term", f"{inp.term_years} years"],
         [
@@ -160,6 +164,8 @@ def build_deal_pdf(inp, out, q: dict) -> bytes:
         ],
         ["Annual escalator", f"{inp.rate_escalator*100:.2f}%"],
     ]
+    if inp.terminal_value > 0:
+        summary_rows.append(["Terminal value at end of term", _fmt_money(inp.terminal_value)])
     story.append(_make_table(summary_rows, [2.5 * inch, 2.5 * inch]))
     story.append(Spacer(1, 8))
 
@@ -186,12 +192,15 @@ def build_deal_pdf(inp, out, q: dict) -> bytes:
         ["Metric", "Value"],
         ["Total CapEx", _fmt_money(out.total_capex)],
         ["Equity at close", _fmt_money(equity_at_close)],
+        [f"  Sponsor cash ({inp.sponsor_equity_pct*100:.0f}%)", _fmt_money(out.sponsor_cash)],
+        [f"  Outside LP equity ({(1-inp.sponsor_equity_pct)*100:.0f}%)", _fmt_money(out.outside_lp_equity)],
         ["ITC cash received Year 1 (real cash)", _fmt_money(out.itc_cash_year1)],
         ["Depreciation tax shield Year 1 (tax benefit, not cash)", _fmt_money(out.bonus_dep_shield_year1)],
         ["Net cash equity after ITC", _fmt_money(net_cash_equity_after_itc)],
         ["Net exposure after ITC + depreciation shield", _fmt_money(net_exposure_after_all)],
         ["After-TC payback", f"Year {out.after_tc_payback_year}" if out.after_tc_payback_year else "Never"],
         [irr_label, _fmt_pct(irr_value)],
+        ["Cash-on-cash yield (operating avg)", _fmt_pct(out.cash_on_cash_yield)],
         ["LCOE (simple)", f"${out.lcoe:.4f}/kWh"],
         ["Year-1 production", f"{out.year1_production_kwh/1000:,.0f} MWh"],
         ["Year-1 revenue / savings", _fmt_money(out.year1_revenue_or_savings)],
@@ -203,25 +212,22 @@ def build_deal_pdf(inp, out, q: dict) -> bytes:
     story.append(_make_table(headline_rows, [3.0 * inch, 2.0 * inch]))
     story.append(Spacer(1, 6))
 
-    # Tax credit stack
+    # Tax credit stack — use the calc engine's own component labels so the PDF
+    # always matches the app (including the small-project-exemption precedence
+    # when both under-1MWac and PWA are true).
     story.append(Paragraph("Section 48E Tax Credit Stack", h1))
     if q and q.get("obbba"):
+        from snapshot_calc import build_itc_pct
+        _, components, _ = build_itc_pct(
+            obbba_eligible=True,
+            under_1_mwac=bool(q.get("under_1mw")),
+            pwa_directly_met=bool(q.get("pwa_direct")),
+            energy_community=bool(q.get("ec")),
+            domestic_content=bool(q.get("dc")),
+            low_income=q.get("li", "None"),
+        )
         tc_rows = [["Component", "Adder"]]
-        components = [
-            ("Base 48E credit", 0.06),
-        ]
-        pwa_eff = q.get("under_1mw") or q.get("pwa_direct")
-        if pwa_eff:
-            components.append(("PWA / Small-project exemption (+24pp)", 0.24))
-        if q.get("ec"):
-            components.append(("Energy Community", 0.10 if pwa_eff else 0.02))
-        if q.get("dc"):
-            components.append(("Domestic Content", 0.10 if pwa_eff else 0.02))
-        if q.get("li") == "10pp":
-            components.append(("Low-Income (+10pp)", 0.10))
-        elif q.get("li") == "20pp":
-            components.append(("Low-Income (+20pp)", 0.20))
-        for name, val in components:
+        for name, val in components.items():
             tc_rows.append([name, f"{val*100:.0f}%"])
         tc_rows.append(["Applicable percentage", f"{inp.itc_pct*100:.1f}%"])
         story.append(_make_table(tc_rows, [3.5 * inch, 1.5 * inch], totals_row=True))
