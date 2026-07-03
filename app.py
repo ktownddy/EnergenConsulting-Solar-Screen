@@ -523,14 +523,34 @@ if f.debt_enabled:
 # ---------- 6. Equity structure and terminal value ----------
 st.markdown("### Equity structure and terminal value")
 c1, c2 = st.columns(2)
-sponsor_pct = c1.number_input(
-    "Sponsor / developer equity share (%)",
-    value=float(f.sponsor_equity_pct) * 100.0,
-    step=1.0, format="%.1f", min_value=0.0, max_value=100.0,
-    help=("What share of the equity check the developer / sponsor covers. Balance is outside-LP equity. "
-          "Splits the equity number pro-rata; does not model pref or promote."),
-)
-f.sponsor_equity_pct = sponsor_pct / 100.0
+with c1:
+    f.sponsor_equity_entry_mode = st.radio(
+        "How do you want to set the sponsor / developer contribution?",
+        ["% of equity", "$ amount"],
+        index=["% of equity", "$ amount"].index(f.sponsor_equity_entry_mode),
+        horizontal=True,
+        help=("% of equity — LP convention: the investor requires the sponsor to hold a "
+              "skin-in-the-game share (typically 10–20%) of the equity check. "
+              "$ amount — developer reality: the sponsor brings a fixed dollar amount "
+              "(cash, rolled dev fee, land value) and the outside-LP ask is whatever gap remains "
+              "after debt. Either way the TOTAL equity check is CapEx minus senior debt — "
+              "this input only splits it."),
+    )
+    if f.sponsor_equity_entry_mode == "$ amount":
+        f.sponsor_equity_amount = st.number_input(
+            "Sponsor / developer contribution ($)",
+            value=float(f.sponsor_equity_amount), step=250_000.0, min_value=0.0,
+            help="What the developer actually brings. Outside-LP ask = equity check minus this.",
+        )
+    else:
+        sponsor_pct = st.number_input(
+            "Sponsor / developer equity share (%)",
+            value=float(f.sponsor_equity_pct) * 100.0,
+            step=1.0, format="%.1f", min_value=0.0, max_value=100.0,
+            help=("What share of the equity check the developer / sponsor covers. Balance is outside-LP equity. "
+                  "Splits the equity number pro-rata; does not model pref or promote."),
+        )
+        f.sponsor_equity_pct = sponsor_pct / 100.0
 
 f.terminal_value = c2.number_input(
     "Terminal / residual value at end of term ($)",
@@ -609,15 +629,16 @@ c4.metric("LCOE (simple)", f"${out.lcoe:.4f}/kWh")
 
 # Sponsor split + operating yield row
 c1, c2, c3, c4 = st.columns(4)
+_eff_sponsor_pct = (out.sponsor_cash / equity_at_close * 100.0) if equity_at_close > 0 else 0.0
 c1.metric(
     "Sponsor cash (skin-in-the-game)",
     _fmt_money(out.sponsor_cash),
-    help=f"{f.sponsor_equity_pct*100:.0f}% of the equity check. This is what the developer / sponsor writes.",
+    help=f"{_eff_sponsor_pct:.0f}% of the equity check. This is what the developer / sponsor writes.",
 )
 c2.metric(
     "Outside LP equity to raise",
     _fmt_money(out.outside_lp_equity),
-    help=f"The remaining {(1-f.sponsor_equity_pct)*100:.0f}% of the equity check. This is what needs to be raised from an outside investor.",
+    help=f"The remaining {100 - _eff_sponsor_pct:.0f}% of the equity check — the gap after debt and sponsor cash. This is the outside raise.",
 )
 c3.metric(
     "Cash-on-cash yield (operating avg)",

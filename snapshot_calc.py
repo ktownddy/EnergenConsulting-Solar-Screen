@@ -128,8 +128,13 @@ class SnapshotInputs:
     # for 20-yr operating solar; 0 = conservative screen).
     terminal_value: float = 0.0
 
-    # Sponsor / developer equity share of the equity check (rest goes to outside LP).
+    # Sponsor / developer contribution to the equity check (rest goes to outside LP).
+    # Two entry modes:
+    #   "% of equity" — LP convention: sponsor holds a skin-in-the-game share (typ. 10-20%)
+    #   "$ amount"    — developer reality: sponsor brings what he has; LP ask = the gap
+    sponsor_equity_entry_mode: str = "% of equity"   # "% of equity" | "$ amount"
     sponsor_equity_pct: float = 0.20
+    sponsor_equity_amount: float = 0.0               # used when mode == "$ amount"
 
     # Tax & credit
     itc_pct: float = 0.40                           # 30% base + 10pp from Energy Community
@@ -418,9 +423,19 @@ def calculate_snapshot(inp: SnapshotInputs) -> SnapshotOutputs:
 
     # ---- Sponsor / outside LP equity split ----
     equity_at_close = total_capex - (debt_amount if inp.debt_enabled else 0.0)
-    sponsor_share = max(0.0, min(1.0, inp.sponsor_equity_pct))
-    sponsor_cash = equity_at_close * sponsor_share
-    outside_lp_equity = equity_at_close - sponsor_cash
+    if inp.sponsor_equity_entry_mode == "$ amount":
+        # Developer brings a fixed dollar amount; the LP ask is the remaining gap.
+        sponsor_cash = max(0.0, min(inp.sponsor_equity_amount, equity_at_close))
+        if inp.sponsor_equity_amount > equity_at_close > 0:
+            warnings.append(
+                f"Sponsor contribution (${inp.sponsor_equity_amount/1e6:.2f}M) exceeds the full equity "
+                f"check (${equity_at_close/1e6:.2f}M). Sponsor covers all equity; no outside LP needed. "
+                "Sponsor cash capped at the equity requirement."
+            )
+    else:
+        sponsor_share = max(0.0, min(1.0, inp.sponsor_equity_pct))
+        sponsor_cash = equity_at_close * sponsor_share
+    outside_lp_equity = max(0.0, equity_at_close - sponsor_cash)
 
     # ---- Cash-on-cash yield (operating years) ----
     # Average of Years 2..N distributions divided by the equity at close. Year 1 is
