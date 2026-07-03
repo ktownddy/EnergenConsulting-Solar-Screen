@@ -628,7 +628,7 @@ c3.metric("Yr-1 tax benefits", _fmt_money(itc_cash_yr1 + dep_shield_yr1),
 c4.metric("LCOE (simple)", f"${out.lcoe:.4f}/kWh")
 
 # Sponsor split + operating yield row
-c1, c2, c3, c4 = st.columns(4)
+c1, c2, c3, c4, c5 = st.columns(5)
 _eff_sponsor_pct = (out.sponsor_cash / equity_at_close * 100.0) if equity_at_close > 0 else 0.0
 c1.metric(
     "Sponsor cash (skin-in-the-game)",
@@ -644,9 +644,18 @@ c3.metric(
     "Cash-on-cash yield (operating avg)",
     _fmt_pct(out.cash_on_cash_yield),
     help=("Average annual distribution during operating years (excludes Year 1's ITC + dep bump) "
-          "divided by equity at close. Key metric for yield-oriented LPs like family offices."),
+          "divided by equity at close. Key metric for yield-oriented LPs like family offices — "
+          "this is what the deal pays every year once it's running. For the 'how fast is my "
+          "money back' story, see Equity back by end of Yr 1."),
 )
-c4.metric("Simple payback (no TC)", f"Yr {out.simple_payback_year}" if out.simple_payback_year else "Never")
+c4.metric(
+    "Equity back by end of Yr 1",
+    _fmt_pct(out.equity_returned_yr1_pct, 0),
+    help=("Year-1 cash INCLUDING ITC proceeds and depreciation shield, as a % of the equity "
+          "check. The capital-recovery headline: how much of the equity is effectively "
+          "returned in the first year. Dep-shield portion requires tax appetite."),
+)
+c5.metric("Simple payback (no TC)", f"Yr {out.simple_payback_year}" if out.simple_payback_year else "Never")
 
 # Debt row, only when debt is on
 if f.debt_enabled and out.debt_amount > 0:

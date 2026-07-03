@@ -201,6 +201,7 @@ def build_deal_pdf(inp, out, q: dict) -> bytes:
         ["After-TC payback", f"Year {out.after_tc_payback_year}" if out.after_tc_payback_year else "Never"],
         [irr_label, _fmt_pct(irr_value)],
         ["Cash-on-cash yield (operating avg)", _fmt_pct(out.cash_on_cash_yield)],
+        ["Equity back by end of Year 1 (incl. ITC + dep shield)", _fmt_pct(out.equity_returned_yr1_pct, 0)],
         ["LCOE (simple)", f"${out.lcoe:.4f}/kWh"],
         ["Year-1 production", f"{out.year1_production_kwh/1000:,.0f} MWh"],
         ["Year-1 revenue / savings", _fmt_money(out.year1_revenue_or_savings)],

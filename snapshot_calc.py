@@ -200,6 +200,7 @@ class SnapshotOutputs:
     sponsor_cash: float                # dollars the developer/sponsor writes
     outside_lp_equity: float           # dollars the outside LP needs to write
     cash_on_cash_yield: Optional[float]  # avg operating-year distribution / equity at close
+    equity_returned_yr1_pct: Optional[float]  # Year-1 cash (incl. ITC + dep shield) / equity at close
 
     verdict: str
     warnings: List[str] = field(default_factory=list)
@@ -454,6 +455,16 @@ def calculate_snapshot(inp: SnapshotInputs) -> SnapshotOutputs:
     else:
         cash_on_cash_yield = None
 
+    # ---- Equity returned by end of Year 1 ----
+    # The capital-recovery view: Year-1 cash INCLUDING the ITC proceeds and depreciation
+    # shield, as a % of the equity check. This is the "how fast is my money back" number —
+    # deliberately separate from cash-on-cash yield, which is the steady-state
+    # "what does it pay me every year" number and excludes the one-time Year-1 tax events.
+    if len(hl_cf) > 1 and equity_at_close > 0:
+        equity_returned_yr1_pct = hl_cf[1] / equity_at_close
+    else:
+        equity_returned_yr1_pct = None
+
     # ---- Verdict ----
     bits: List[str] = []
     if after_tc_pb is not None and after_tc_pb <= 7:
@@ -575,6 +586,7 @@ def calculate_snapshot(inp: SnapshotInputs) -> SnapshotOutputs:
         sponsor_cash=sponsor_cash,
         outside_lp_equity=outside_lp_equity,
         cash_on_cash_yield=cash_on_cash_yield,
+        equity_returned_yr1_pct=equity_returned_yr1_pct,
         verdict=verdict,
         warnings=warnings,
     )
