@@ -175,8 +175,6 @@ def build_deal_pdf(inp, out, q: dict) -> bytes:
 
     # Headline metrics — two-column grid
     story.append(Paragraph("Headline Metrics", h1))
-    irr_label = "Levered IRR" if (inp.debt_enabled and out.debt_amount > 0) else "IRR (post-TC)"
-    irr_value = out.levered_irr if out.levered_irr is not None else out.unlevered_irr
     equity_at_close = out.total_capex - (out.debt_amount if inp.debt_enabled else 0.0)
     yr1_tax_benefits = out.itc_cash_year1 + out.bonus_dep_shield_year1
     net_equity_after_yr1 = equity_at_close - yr1_tax_benefits
@@ -198,16 +196,19 @@ def build_deal_pdf(inp, out, q: dict) -> bytes:
         ["Depreciation tax shield Year 1 (tax benefit, not cash)", _fmt_money(out.bonus_dep_shield_year1)],
         ["Net cash equity after ITC", _fmt_money(net_cash_equity_after_itc)],
         ["Net exposure after ITC + depreciation shield", _fmt_money(net_exposure_after_all)],
-        ["After-TC payback", f"Year {out.after_tc_payback_year}" if out.after_tc_payback_year else "Never"],
-        [irr_label, _fmt_pct(irr_value)],
+        ["Project payback after credits (unlevered)", f"Year {out.unlevered_payback_year}" if out.unlevered_payback_year else "Never"],
+        [f"Unlevered project IRR (hurdle {inp.hurdle_unlevered_irr*100:.1f}%)", _fmt_pct(out.unlevered_irr)],
         ["Cash-on-cash yield (operating avg)", _fmt_pct(out.cash_on_cash_yield)],
         ["Equity back by end of Year 1 (incl. ITC + dep shield)", _fmt_pct(out.equity_returned_yr1_pct, 0)],
         ["LCOE (simple)", f"${out.lcoe:.4f}/kWh"],
         ["Year-1 production", f"{out.year1_production_kwh/1000:,.0f} MWh"],
         ["Year-1 revenue / savings", _fmt_money(out.year1_revenue_or_savings)],
     ]
+    if out.unlevered_irr_no_itc is not None:
+        headline_rows.append(["Unlevered IRR without the ITC", _fmt_pct(out.unlevered_irr_no_itc)])
     if inp.debt_enabled and out.debt_amount > 0:
         leverage = out.debt_amount / out.total_capex if out.total_capex else 0
+        headline_rows.append(["Levered IRR (information only, no bridge loan)", _fmt_pct(out.levered_irr)])
         headline_rows.append(["Senior debt", f"{_fmt_money(out.debt_amount)}  ({leverage*100:.1f}% LTC)"])
         headline_rows.append(["Min DSCR / Avg DSCR", f"{_fmt_x(out.min_dscr)}  /  {_fmt_x(out.avg_dscr)}"])
     story.append(_make_table(headline_rows, [3.0 * inch, 2.0 * inch]))
@@ -217,6 +218,12 @@ def build_deal_pdf(inp, out, q: dict) -> bytes:
     # always matches the app (including the small-project-exemption precedence
     # when both under-1MWac and PWA are true).
     story.append(Paragraph("Section 48E Tax Credit Stack", h1))
+    if q and q.get("tax_clock"):
+        from snapshot_calc import TAX_CLOCK_OPTIONS
+        clock_txt = TAX_CLOCK_OPTIONS.get(q["tax_clock"], q["tax_clock"])
+        if q["tax_clock"] == "planned_pis" and q.get("planned_pis"):
+            clock_txt += f". Planned placed in service: {q['planned_pis']}"
+        story.append(Paragraph(f"<b>Credit deadline:</b> {clock_txt}.", body))
     if q and q.get("obbba"):
         from snapshot_calc import build_itc_pct
         _, components, _ = build_itc_pct(
@@ -234,7 +241,7 @@ def build_deal_pdf(inp, out, q: dict) -> bytes:
         story.append(_make_table(tc_rows, [3.5 * inch, 1.5 * inch], totals_row=True))
     else:
         story.append(Paragraph(
-            "<b>No §48E credit available</b> — OBBBA construction safe-harbor cutoff not met. "
+            "<b>No §48E credit available.</b> The project does not meet the OBBBA solar credit deadline. "
             "Project economics rely on revenue, depreciation, and any state incentives.",
             body,
         ))

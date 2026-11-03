@@ -12,7 +12,8 @@ Designed to be:
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from datetime import date
 from typing import List, Optional, Tuple
 
 from finance_math import safe_irr, equity_multiple, payback_year, amortization_payment, pv_annuity
@@ -32,6 +33,25 @@ DEFAULT_OM = {
     "Rooftop":              12.0,
     "Ground (fixed-tilt)":  15.0,
     "Ground (tracking)":    18.0,
+}
+
+# MACRS percentages, half year convention (IRS Pub 946, Table A-1).
+# OBBBA section 70509 removed solar from 168(e)(3)(B)(vi), but IRS Pub 946 (2025) says 48E
+# qualified property placed in service after 2024 is 5 year property under 168(e)(3)(B)(viii).
+# 20 years is shown only as a sensitivity for solar that may not qualify for 48E. Counsel confirms.
+MACRS_SCHEDULES = {
+    5: [0.20, 0.32, 0.192, 0.1152, 0.1152, 0.0576],
+    20: [0.0375, 0.07219, 0.06677, 0.06177, 0.05713, 0.05285, 0.04888, 0.04522,
+         0.04462, 0.04461, 0.04462, 0.04461, 0.04462, 0.04461, 0.04462, 0.04461,
+         0.04462, 0.04461, 0.04462, 0.04461, 0.02231],
+}
+
+# Solar credit clock under OBBBA. Storage is not subject to these dates.
+SOLAR_PIS_DEADLINE = date(2027, 12, 31)   # for solar that began construction after July 4, 2026
+TAX_CLOCK_OPTIONS = {
+    "safe_harbor": "Safe harbored: construction began by July 4, 2026, evidence in hand",
+    "planned_pis": "Not safe harbored: must be placed in service by Dec 31, 2027",
+    "none": "Neither: no solar credit",
 }
 
 
@@ -138,8 +158,15 @@ class SnapshotInputs:
 
     # Tax & credit
     itc_pct: float = 0.40                           # 30% base + 10pp from Energy Community
+    # True when the credit depends on hitting the Dec 31, 2027 placed in service date
+    # (not safe harbored). The verdict then also tests the deal without the credit.
+    itc_at_risk: bool = False
     tax_rate: float = 0.27
     bonus_depreciation_pct: float = 1.0
+    macrs_years: int = 5                            # recovery period for basis not taken as bonus (5 or 20)
+
+    # Screening hurdle. The verdict tests UNLEVERED project IRR against this.
+    hurdle_unlevered_irr: float = 0.08
 
     # Transferability — user's preferred screening assumption is unencumbered
     # net proceeds (no holdback, no txn cost). Real deals will have both;
@@ -205,6 +232,12 @@ class SnapshotOutputs:
     verdict: str
     warnings: List[str] = field(default_factory=list)
 
+    # Added Oct 2026
+    annual_dep_shield: List[float] = field(default_factory=list)
+    unlevered_payback_year: Optional[int] = None     # after credits, no debt
+    unlevered_irr_no_itc: Optional[float] = None     # only when the credit is at risk
+    verdict_tier: str = "weak"                       # "strong" | "clears" | "conditional" | "weak"
+
 
 # ---------- Main calc ----------
 
@@ -252,9 +285,32 @@ def calculate_snapshot(inp: SnapshotInputs) -> SnapshotOutputs:
             * inp.transfer_sale_price
             * (1 - inp.transfer_transaction_cost_pct - inp.recapture_reserve_pct)
         )
+    # Section 50(c): depreciable basis is reduced by half the ITC. Bonus is taken in
+    # Year 1; any remainder is depreciated on the chosen MACRS schedule.
     depreciable_basis = total_capex * (1.0 - 0.5 * inp.itc_pct)
-    bonus_dep_year1 = depreciable_basis * inp.bonus_depreciation_pct
-    bonus_dep_shield_year1 = bonus_dep_year1 * inp.tax_rate
+    bonus_pct = max(0.0, min(1.0, inp.bonus_depreciation_pct))
+    annual_depreciation = [0.0] * inp.term_years
+    if inp.term_years > 0:
+        bonus_amount = depreciable_basis * bonus_pct
+        annual_depreciation[0] += bonus_amount
+        remainder = depreciable_basis - bonus_amount
+        if remainder > 0.01:
+            macrs_years = int(inp.macrs_years)
+            schedule = MACRS_SCHEDULES.get(macrs_years)
+            if schedule is None:
+                warnings.append(f"MACRS period of {macrs_years} years is not supported; used 20 years.")
+                schedule = MACRS_SCHEDULES[20]
+            for i, pct in enumerate(schedule):
+                if i < inp.term_years:
+                    annual_depreciation[i] += remainder * pct
+            if len(schedule) > inp.term_years:
+                lost = remainder * sum(schedule[inp.term_years:])
+                warnings.append(
+                    f"${lost/1e6:.2f}M of depreciation falls after the {inp.term_years} year analysis "
+                    "term and is not counted."
+                )
+    annual_dep_shield = [d * inp.tax_rate for d in annual_depreciation]
+    bonus_dep_shield_year1 = annual_dep_shield[0] if annual_dep_shield else 0.0
 
     # ---- Optional debt sizing ----
     debt_amount = 0.0
@@ -349,12 +405,10 @@ def calculate_snapshot(inp: SnapshotInputs) -> SnapshotOutputs:
     unlevered_cf = [-total_capex]
     for y in range(inp.term_years):
         operating = annual_ebitda[y]
+        tax = operating * inp.tax_rate - annual_dep_shield[y]
+        after_tax = operating - tax
         if y == 0:
-            tax = operating * inp.tax_rate - bonus_dep_shield_year1
-            after_tax = operating - tax + itc_cash_year1
-        else:
-            tax = operating * inp.tax_rate
-            after_tax = operating - tax
+            after_tax += itc_cash_year1
         unlevered_cf.append(after_tax)
 
     # Levered: -(CapEx - debt_amount) at t=0, then EBITDA - debt service - tax (incl shields)
@@ -365,12 +419,10 @@ def calculate_snapshot(inp: SnapshotInputs) -> SnapshotOutputs:
             operating = annual_ebitda[y]
             ds = annual_debt_service[y]
             interest_paid = annual_interest[y]
+            tax = (operating - interest_paid) * inp.tax_rate - annual_dep_shield[y]
+            after_tax = operating - ds - tax
             if y == 0:
-                tax = (operating - interest_paid) * inp.tax_rate - bonus_dep_shield_year1
-                after_tax = operating - ds - tax + itc_cash_year1
-            else:
-                tax = (operating - interest_paid) * inp.tax_rate
-                after_tax = operating - ds - tax
+                after_tax += itc_cash_year1
             levered_cf.append(after_tax)
         # Balloon payoff of any balance remaining past the analysis term
         if balloon_payoff_final > 0:
@@ -414,6 +466,11 @@ def calculate_snapshot(inp: SnapshotInputs) -> SnapshotOutputs:
     simple_pb = payback_year(simple_cf)
     after_tc_pb = payback_year(headline_cf)
     unlev_irr = safe_irr(unlevered_cf)
+    unlev_pb = payback_year(unlevered_cf)
+    # When the credit depends on the placed in service date, also test the deal without it.
+    unlev_irr_no_itc = None
+    if inp.itc_at_risk and inp.itc_pct > 0:
+        unlev_irr_no_itc = calculate_snapshot(replace(inp, itc_pct=0.0, itc_at_risk=False)).unlevered_irr
     lev_irr = safe_irr(levered_cf) if (inp.debt_enabled and debt_amount > 0) else None
 
     # LCOE (simple, undiscounted)
@@ -466,23 +523,38 @@ def calculate_snapshot(inp: SnapshotInputs) -> SnapshotOutputs:
         equity_returned_yr1_pct = None
 
     # ---- Verdict ----
+    # Driven by UNLEVERED project IRR against the hurdle. Levered IRR and levered payback
+    # are not used: this screen has no bridge loan, so when the ITC arrives in Year 1
+    # against equity sized on full cost, levered returns are badly overstated.
+    hurdle = inp.hurdle_unlevered_irr
     bits: List[str] = []
-    if after_tc_pb is not None and after_tc_pb <= 7:
-        bits.append("Strong screen")
-    elif after_tc_pb is not None and after_tc_pb <= 10:
-        bits.append("Decent screen")
-    elif after_tc_pb is not None:
-        bits.append(f"Marginal — payback {after_tc_pb}yr")
-    else:
-        bits.append("Project does not pay back within term")
 
-    headline_irr = lev_irr if lev_irr is not None else unlev_irr
-    if headline_irr is not None and headline_irr > 0.15:
-        bits.append(f"IRR {headline_irr*100:.0f}%")
-    elif headline_irr is not None and headline_irr > 0.08:
-        bits.append(f"IRR {headline_irr*100:.0f}%")
-    elif headline_irr is not None:
-        bits.append(f"IRR only {headline_irr*100:.0f}%")
+    def _p(v):
+        return "N/M" if v is None else f"{v*100:.1f}%"
+
+    credit_at_risk = inp.itc_at_risk and inp.itc_pct > 0
+    if unlev_irr is None or unlev_irr < hurdle:
+        verdict_tier = "weak"
+        bits.append(f"Below hurdle: unlevered IRR {_p(unlev_irr)} vs {hurdle*100:.1f}%")
+    elif credit_at_risk and (unlev_irr_no_itc is None or unlev_irr_no_itc < hurdle):
+        verdict_tier = "conditional"
+        bits.append(
+            f"Clears the {hurdle*100:.1f}% hurdle only with the ITC: unlevered IRR {_p(unlev_irr)} with it, "
+            f"{_p(unlev_irr_no_itc)} without it. The credit needs placed in service by Dec 31, 2027"
+        )
+    elif unlev_irr >= hurdle + 0.02:
+        verdict_tier = "strong"
+        bits.append(f"Strong screen: unlevered IRR {_p(unlev_irr)} vs {hurdle*100:.1f}% hurdle")
+    else:
+        verdict_tier = "clears"
+        bits.append(f"Clears hurdle: unlevered IRR {_p(unlev_irr)} vs {hurdle*100:.1f}%")
+    if credit_at_risk and verdict_tier in ("strong", "clears"):
+        bits.append(f"still clears without the ITC ({_p(unlev_irr_no_itc)})")
+
+    if unlev_pb is not None:
+        bits.append(f"project payback year {unlev_pb} after credits")
+    else:
+        bits.append("project does not pay back within term")
 
     if inp.owner_mode == "Customer-owned":
         savings = rate_yr1 - lcoe
@@ -505,9 +577,9 @@ def calculate_snapshot(inp: SnapshotInputs) -> SnapshotOutputs:
         if min_dscr >= inp.min_dscr_requirement:
             bits.append(f"min DSCR {min_dscr:.2f}x (bankable)")
         else:
-            bits.append(f"min DSCR {min_dscr:.2f}x (below {inp.min_dscr_requirement:.2f}x — needs resize)")
+            bits.append(f"min DSCR {min_dscr:.2f}x (below {inp.min_dscr_requirement:.2f}x, needs resize)")
 
-    verdict = " — ".join(bits) + "."
+    verdict = "; ".join(bits) + "."
 
     # ---- Sanity warnings ----
     if inp.cost_per_watt > 5.0:
@@ -540,6 +612,18 @@ def calculate_snapshot(inp: SnapshotInputs) -> SnapshotOutputs:
             "Depreciation tax shield is counted in cash flows. This assumes the owner has "
             "sufficient tax appetite to use it (full external income offset). For tax-exempt "
             "or low-appetite owners, switch the depreciation toggle to No."
+        )
+
+    if credit_at_risk:
+        warnings.append(
+            "Not safe harbored: the solar credit is lost if the project is not placed in service by "
+            "Dec 31, 2027. Treat the ITC as upside unless the schedule has real margin."
+        )
+    if inp.debt_enabled and debt_amount > 0 and itc_cash_year1 > 0:
+        warnings.append(
+            "Levered IRR and levered payback are information only. This screen has no bridge loan, "
+            "so the ITC arrives in Year 1 against equity sized on full cost, which overstates equity "
+            "returns. The verdict uses unlevered project IRR."
         )
 
     # Debt sizing source flag — useful for the screener
@@ -589,6 +673,10 @@ def calculate_snapshot(inp: SnapshotInputs) -> SnapshotOutputs:
         equity_returned_yr1_pct=equity_returned_yr1_pct,
         verdict=verdict,
         warnings=warnings,
+        annual_dep_shield=annual_dep_shield,
+        unlevered_payback_year=unlev_pb,
+        unlevered_irr_no_itc=unlev_irr_no_itc,
+        verdict_tier=verdict_tier,
     )
 
 
@@ -605,8 +693,8 @@ def _set_rate(inp: SnapshotInputs, rate: float) -> SnapshotInputs:
 
 
 def _eff_irr(out: SnapshotOutputs) -> float:
-    headline = out.levered_irr if out.levered_irr is not None else out.unlevered_irr
-    return headline if headline is not None else -0.99
+    # Solvers target UNLEVERED project IRR (levered IRR is overstated with no bridge loan).
+    return out.unlevered_irr if out.unlevered_irr is not None else -0.99
 
 
 def solve_rate_for_irr(inp: SnapshotInputs, target_irr: float,
@@ -688,19 +776,19 @@ def solve_cost_for_payback(
     Lower cost -> faster payback; higher cost -> slower payback.
     """
     out_lo = calculate_snapshot(_set_cost(inp, low))
-    pb_lo = out_lo.after_tc_payback_year
+    pb_lo = out_lo.unlevered_payback_year
     if pb_lo is None or pb_lo > target_year:
         return None
 
     out_hi = calculate_snapshot(_set_cost(inp, high))
-    pb_hi = out_hi.after_tc_payback_year
+    pb_hi = out_hi.unlevered_payback_year
     if pb_hi is not None and pb_hi <= target_year:
         return high
 
     for _ in range(max_iter):
         mid = 0.5 * (low + high)
         out_mid = calculate_snapshot(_set_cost(inp, mid))
-        pb = out_mid.after_tc_payback_year
+        pb = out_mid.unlevered_payback_year
         if pb is None or pb > target_year:
             high = mid
         else:
@@ -714,15 +802,15 @@ def solve_rate_for_payback(inp: SnapshotInputs, target_year: int,
                             low: float = 0.001, high: float = 0.50,
                             max_iter: int = 60) -> Optional[float]:
     out_hi = calculate_snapshot(_set_rate(inp, high))
-    if out_hi.after_tc_payback_year is None or out_hi.after_tc_payback_year > target_year:
+    if out_hi.unlevered_payback_year is None or out_hi.unlevered_payback_year > target_year:
         return None
     out_lo = calculate_snapshot(_set_rate(inp, low))
-    if out_lo.after_tc_payback_year is not None and out_lo.after_tc_payback_year <= target_year:
+    if out_lo.unlevered_payback_year is not None and out_lo.unlevered_payback_year <= target_year:
         return low
     for _ in range(max_iter):
         mid = 0.5 * (low + high)
         out_mid = calculate_snapshot(_set_rate(inp, mid))
-        pb = out_mid.after_tc_payback_year
+        pb = out_mid.unlevered_payback_year
         if pb is None or pb > target_year:
             low = mid
         else:

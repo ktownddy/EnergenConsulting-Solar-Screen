@@ -25,6 +25,8 @@ from snapshot_calc import (
     build_itc_pct,
     DEFAULT_YIELDS,
     DEFAULT_OM,
+    TAX_CLOCK_OPTIONS,
+    SOLAR_PIS_DEADLINE,
 )
 from pdf_export import build_deal_pdf
 
@@ -179,12 +181,18 @@ if "itc_q" not in st.session_state:
     # more common Energen deal pathway. If a project has verified Domestic Content
     # instead, the user can toggle DC on and EC off in the credit Q&A section.
     st.session_state.itc_q = {
-        "obbba": True, "under_1mw": False, "pwa_direct": True,
+        "tax_clock": "none", "planned_pis": "2027-06-30",
+        "obbba": False, "under_1mw": False, "pwa_direct": True,
         "ec": True, "dc": False, "li": "None",
     }
 
 f: SnapshotInputs = st.session_state.snap
 q = st.session_state.itc_q
+# Deals saved before Oct 2026 carry only the old single "obbba" answer. That answer did not
+# say whether the project was safe harbored, so map Yes to the stricter "planned in service".
+if "tax_clock" not in q:
+    q["tax_clock"] = "planned_pis" if q.get("obbba") else "none"
+    q.setdefault("planned_pis", "2027-06-30")
 
 
 # ---------- Save / load deal (JSON) ----------
@@ -229,6 +237,7 @@ with st.expander("Save or load a deal", expanded=False):
                 # Sync the depreciation radio to the loaded deal
                 _s = st.session_state.snap
                 st.session_state["dep_radio"] = "Yes" if (_s.bonus_depreciation_pct > 0 or _s.tax_rate > 0) else "No"
+                st.session_state["dep_method"] = "100% bonus in Year 1" if _s.bonus_depreciation_pct > 0 else "MACRS, no bonus"
                 st.session_state["_loaded_deal_sig"] = _sig
                 st.success("Deal loaded.")
                 st.rerun()
@@ -345,18 +354,57 @@ f.term_years = c4.number_input(
 # ---------- 3. Tax credit Q&A ----------
 st.markdown("### Tax credit (Section 48E)")
 
-q["obbba"] = st.radio(
-    "Did the project safe-harbor under OBBBA — start of construction by July 4, 2026, OR placed in service by Dec 31, 2027?",
-    ["Yes", "No"], index=0 if q["obbba"] else 1, horizontal=True,
-    help=("OBBBA terminates Section 48E for solar unless one of these dates is hit. "
-          "If No, there is no federal tax credit."),
-) == "Yes"
+_clock_keys = list(TAX_CLOCK_OPTIONS.keys())
+q["tax_clock"] = st.radio(
+    "Where does the project stand on the solar credit deadline?",
+    _clock_keys,
+    index=_clock_keys.index(q.get("tax_clock", "none")),
+    format_func=lambda k: TAX_CLOCK_OPTIONS[k],
+    help=("Under OBBBA, solar that began construction by July 4, 2026 keeps the credit if it is placed "
+          "in service within the continuity safe harbor. Solar that starts later must be placed in "
+          "service by Dec 31, 2027 or the credit is lost. Storage is not subject to these dates. "
+          "Confirm with tax counsel."),
+)
+_credit_available = q["tax_clock"] != "none"
+f.itc_at_risk = q["tax_clock"] == "planned_pis"
+if q["tax_clock"] == "planned_pis":
+    import datetime as _dt
+    try:
+        _pis_default = _dt.date.fromisoformat(q.get("planned_pis") or "2027-06-30")
+    except ValueError:
+        _pis_default = _dt.date(2027, 6, 30)
+    _pis = st.date_input("Planned placed in service date", value=_pis_default)
+    q["planned_pis"] = _pis.isoformat()
+    _margin_days = (SOLAR_PIS_DEADLINE - _pis).days
+    _m = _margin_days // 30
+    _margin_txt = "Less than a month" if _m < 1 else f"About {_m} month{'s' if _m != 1 else ''}"
+    if _margin_days < 0:
+        _credit_available = False
+        st.error("Planned placed in service date is after Dec 31, 2027, so there is no solar credit.")
+    elif _margin_days < 183:
+        st.warning(
+            f"{_margin_txt} of margin to Dec 31, 2027. A short slip loses the whole "
+            "credit. The verdict shows the IRR with and without it."
+        )
+    else:
+        st.info(
+            f"{_margin_txt} of margin to Dec 31, 2027. The verdict still tests the "
+            "deal without the credit."
+        )
+elif q["tax_clock"] == "safe_harbor":
+    st.caption(
+        "Continuity safe harbor: placed in service by the end of the fourth calendar year after "
+        "construction began (Dec 31, 2030 for a 2026 start). Keep the beginning of construction "
+        "evidence in the file."
+    )
+q["obbba"] = _credit_available  # kept for older saved deals and the PDF
 
-if not q["obbba"]:
+if not _credit_available:
     f.itc_pct = 0.0
+    f.itc_at_risk = False
     st.error(
-        "No Section 48E tax credit available under the OBBBA cutoff. ITC = 0%. "
-        "Project economics will rely entirely on revenue, depreciation, and any state incentives."
+        "No Section 48E solar credit. ITC = 0%. "
+        "Project economics rely on revenue, depreciation, and any state incentives."
     )
 else:
     c1, c2, c3 = st.columns(3)
@@ -453,7 +501,7 @@ if "dep_radio" not in st.session_state:
 can_use_dep = c1.radio(
     f"Can {who} use the depreciation (sufficient tax appetite)?",
     ["Yes", "No"], horizontal=True, key="dep_radio",
-    help=("Yes = 100% bonus depreciation Year 1 + tax on operating income. "
+    help=("Yes = the owner uses depreciation and pays tax on operating income; pick bonus or MACRS below. "
           "No = no depreciation shield, no operating tax (tax-exempt owner)."),
 ) == "Yes"
 if can_use_dep:
@@ -465,7 +513,28 @@ if can_use_dep:
         format="%.4f",
     )
     f.tax_rate = tax_pct / 100.0
-    f.bonus_depreciation_pct = 1.0
+    _methods = ["100% bonus in Year 1", "MACRS, no bonus"]
+    if "dep_method" not in st.session_state:
+        st.session_state["dep_method"] = _methods[0] if f.bonus_depreciation_pct > 0 else _methods[1]
+    c1b, c2b = st.columns(2)
+    _method = c1b.radio(
+        "Depreciation method", _methods, horizontal=True, key="dep_method",
+        help=("100% bonus is permanent under OBBBA for property acquired after Jan 19, 2025. "
+              "Choose MACRS if the owner will not take bonus."),
+    )
+    if _method == _methods[0]:
+        f.bonus_depreciation_pct = 1.0
+    else:
+        f.bonus_depreciation_pct = 0.0
+        _periods = [5, 20]
+        f.macrs_years = c2b.radio(
+            "MACRS recovery period", _periods,
+            index=_periods.index(f.macrs_years) if f.macrs_years in _periods else 0,
+            horizontal=True, format_func=lambda n: f"{n} years",
+            help=("5 years: 48E qualified property placed in service after 2024 (168(e)(3)(B)(viii), IRS Pub 946). "
+                  "20 years: a sensitivity for solar that may not qualify for the 48E credit. "
+                  "Tax counsel confirms the class."),
+        )
 else:
     f.tax_rate = 0.0
     f.bonus_depreciation_pct = 0.0
@@ -560,6 +629,16 @@ f.terminal_value = c2.number_input(
 )
 
 
+# ---------- Screening hurdle ----------
+st.markdown("### Screening hurdle")
+_hurdle = st.number_input(
+    "Hurdle: unlevered project IRR (%)",
+    value=float(f.hurdle_unlevered_irr) * 100.0, step=0.5, format="%.2f",
+    help="The verdict tests unlevered project IRR against this. The Deal Qualifier uses 8%.",
+)
+f.hurdle_unlevered_irr = _hurdle / 100.0
+
+
 # ---------- Calculate ----------
 out = calculate_snapshot(f)
 
@@ -567,11 +646,12 @@ out = calculate_snapshot(f)
 # ---------- Verdict banner ----------
 st.divider()
 
-verdict_class = "verdict-decent"
-if out.after_tc_payback_year is not None and out.after_tc_payback_year <= 7:
-    verdict_class = "verdict-strong"
-elif out.after_tc_payback_year is None or out.after_tc_payback_year > 10:
-    verdict_class = "verdict-weak"
+verdict_class = {
+    "strong": "verdict-strong",
+    "clears": "verdict-decent",
+    "conditional": "verdict-decent",
+    "weak": "verdict-weak",
+}.get(out.verdict_tier, "verdict-weak")
 
 st.markdown(
     f'<div class="{verdict_class}">Verdict: {out.verdict}</div>',
@@ -598,10 +678,18 @@ c1, c2, c3, c4 = st.columns(4)
 c1.metric("Total CapEx", _fmt_money(out.total_capex))
 c2.metric("Equity at close", _fmt_money(equity_at_close),
           help="What you or your investor write at financial close. CapEx minus senior debt.")
-c3.metric("After-TC payback", f"Yr {out.after_tc_payback_year}" if out.after_tc_payback_year else "Never")
-headline_irr = out.levered_irr if out.levered_irr is not None else out.unlevered_irr
-irr_label = "Levered IRR" if f.debt_enabled and out.debt_amount > 0 else "IRR (post-tax-credit)"
-c4.metric(irr_label, _fmt_pct(headline_irr))
+c3.metric("Project payback (after credits)",
+          f"Yr {out.unlevered_payback_year}" if out.unlevered_payback_year else "Never",
+          help="Unlevered: years until project cash, including the ITC and depreciation, repays total CapEx.")
+c4.metric("Unlevered project IRR", _fmt_pct(out.unlevered_irr),
+          delta=(f"{(out.unlevered_irr - f.hurdle_unlevered_irr)*100:+.1f} pts vs hurdle"
+                 if out.unlevered_irr is not None else None),
+          help="The number the verdict uses. Levered IRR is shown in the debt row for information only.")
+if out.unlevered_irr_no_itc is not None:
+    st.caption(
+        f"Without the ITC: unlevered IRR **{_fmt_pct(out.unlevered_irr_no_itc)}**. "
+        "The credit depends on placed in service by Dec 31, 2027."
+    )
 
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("ITC cash received Yr 1", _fmt_money(itc_cash_yr1),
@@ -659,12 +747,15 @@ c5.metric("Simple payback (no TC)", f"Yr {out.simple_payback_year}" if out.simpl
 
 # Debt row, only when debt is on
 if f.debt_enabled and out.debt_amount > 0:
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     leverage = out.debt_amount / out.total_capex if out.total_capex else 0
     c1.metric("Senior debt", _fmt_money(out.debt_amount))
     c2.metric("Implied leverage", f"{leverage*100:.1f}%")
     c3.metric("Min DSCR", _fmt_x(out.min_dscr))
     c4.metric("Avg DSCR", _fmt_x(out.avg_dscr))
+    c5.metric("Levered IRR (info only)", _fmt_pct(out.levered_irr),
+              help=("No bridge loan in this screen, so when the ITC arrives in Year 1 this overstates "
+                    "equity returns. Not used in the verdict."))
 
 
 # ---------- Spread context ----------
@@ -747,7 +838,7 @@ st.plotly_chart(waterfall, width="stretch")
 
 
 # ---------- Cumulative cash chart ----------
-headline_cum = out.cumulative_levered_cf if (f.debt_enabled and out.debt_amount > 0) else out.cumulative_unlevered_cf
+headline_cum = out.cumulative_unlevered_cf
 years_axis = list(range(0, len(headline_cum)))
 fig = go.Figure()
 fig.add_scatter(
@@ -757,14 +848,14 @@ fig.add_scatter(
     name="Cumulative cash",
 )
 fig.add_hline(y=0, line_dash="dash", line_color=TAN)
-if out.after_tc_payback_year is not None:
+if out.unlevered_payback_year is not None:
     fig.add_vline(
-        x=out.after_tc_payback_year, line_dash="dot", line_color=GOLD,
-        annotation_text=f"Payback yr {out.after_tc_payback_year}",
+        x=out.unlevered_payback_year, line_dash="dot", line_color=GOLD,
+        annotation_text=f"Payback yr {out.unlevered_payback_year}",
         annotation_position="top",
     )
 fig.update_layout(
-    title="Cumulative cash position (after ITC + depreciation shield)",
+    title="Cumulative project cash, unlevered (after ITC + depreciation shield)",
     xaxis_title="Year", yaxis_title="Cumulative cash ($)",
     height=380, margin=dict(l=10, r=10, t=40, b=10),
     plot_bgcolor=PARCHMENT, paper_bgcolor=PARCHMENT,
@@ -820,11 +911,12 @@ st.caption(
 )
 c1, c2 = st.columns(2)
 target_irr_pct = c1.number_input(
-    "Target IRR (%)", value=10.0, step=0.5, format="%.2f",
-    help="e.g. 10 = 10% IRR (levered if debt is on, otherwise all-equity).",
+    "Target unlevered IRR (%)", value=float(f.hurdle_unlevered_irr) * 100.0, step=0.5, format="%.2f",
+    help="Unlevered project IRR. Defaults to the screening hurdle.",
 )
 target_payback = c2.number_input(
     "Target payback (years)", value=7, step=1, min_value=2, max_value=30,
+    help="Unlevered project payback after credits.",
 )
 
 rate_for_irr = solve_rate_for_irr(f, target_irr=target_irr_pct / 100.0)
@@ -877,12 +969,12 @@ st.caption(
 
 c1, c2, c3 = st.columns(3)
 cost_target_irr_pct = c1.number_input(
-    "Target IRR (%)", value=10.0, step=0.5, format="%.2f", key="cost_irr",
-    help="Levered IRR if debt is on, otherwise unlevered.",
+    "Target unlevered IRR (%)", value=float(f.hurdle_unlevered_irr) * 100.0, step=0.5, format="%.2f", key="cost_irr",
+    help="Unlevered project IRR. Defaults to the screening hurdle.",
 )
 cost_min_dscr = c2.number_input(
     "Min DSCR", value=float(f.min_dscr_requirement), step=0.05, format="%.2f", key="cost_dscr",
-    help="Drives the DSCR floor when re-sizing debt across the search range. Only binds when debt is on with DSCR-sized sizing.",
+    help="Re-sizes the debt shown across the search range. It does not change the unlevered IRR or payback targets.",
 )
 cost_target_payback = c3.number_input(
     "Min acceptable payback (years)", value=10, step=1, min_value=2, max_value=30, key="cost_pb",
@@ -990,7 +1082,6 @@ def _run_case(cost_per_w: float):
     o = calculate_snapshot(g)
     eq_close = o.total_capex - (o.debt_amount if g.debt_enabled else 0.0)
     net_cash_eq = eq_close - o.itc_cash_year1
-    headline_irr_v = o.levered_irr if o.levered_irr is not None else o.unlevered_irr
     return {
         "Cost/Wdc": f"${cost_per_w:.2f}",
         "Total CapEx": _fmt_money(o.total_capex),
@@ -998,15 +1089,17 @@ def _run_case(cost_per_w: float):
         "ITC cash (Yr 1)": _fmt_money(o.itc_cash_year1),
         "Equity at close": _fmt_money(eq_close),
         "Net cash equity after ITC": _fmt_money(net_cash_eq),
-        "Levered IRR": _fmt_pct(headline_irr_v),
-        "Min DSCR": _fmt_x(o.min_dscr) if g.debt_enabled else "—",
-        "Payback": f"Yr {o.after_tc_payback_year}" if o.after_tc_payback_year else "Never",
-        "Verdict": (
-            "Strong" if (o.after_tc_payback_year is not None and o.after_tc_payback_year <= 7)
-            else "Decent" if (o.after_tc_payback_year is not None and o.after_tc_payback_year <= 10)
-            else "Marginal" if o.after_tc_payback_year is not None
-            else "Doesn't pay back"
-        ),
+        "Unlevered IRR": _fmt_pct(o.unlevered_irr),
+        "Unlevered IRR without ITC": _fmt_pct(o.unlevered_irr_no_itc) if o.unlevered_irr_no_itc is not None else "n/a",
+        "Levered IRR (info only)": _fmt_pct(o.levered_irr) if o.levered_irr is not None else "n/a",
+        "Min DSCR": _fmt_x(o.min_dscr) if g.debt_enabled else "n/a",
+        "Project payback": f"Yr {o.unlevered_payback_year}" if o.unlevered_payback_year else "Never",
+        "Verdict": {
+            "strong": "Strong",
+            "clears": "Clears hurdle",
+            "conditional": "Only with ITC",
+            "weak": "Below hurdle",
+        }.get(o.verdict_tier, "Below hurdle"),
     }
 
 scenario_df = pd.DataFrame({
@@ -1025,10 +1118,10 @@ st.markdown("### Sanity warnings")
 
 cross_warnings = []
 # Levered IRR below target IRR (using the cost section's target as the reference)
-hl_irr = out.levered_irr if out.levered_irr is not None else out.unlevered_irr
+hl_irr = out.unlevered_irr
 if hl_irr is not None and hl_irr < cost_target_irr_pct / 100.0:
     cross_warnings.append(
-        f"Levered IRR ({hl_irr*100:.1f}%) is below your target ({cost_target_irr_pct:.1f}%). "
+        f"Unlevered project IRR ({hl_irr*100:.1f}%) is below your target ({cost_target_irr_pct:.1f}%). "
         "Either raise the revenue rate, drop CapEx, or layer in more credit/bonuses."
     )
 # Current cost above solved max supportable cost
